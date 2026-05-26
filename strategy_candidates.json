@@ -1,101 +1,280 @@
 {
   "version": 1,
-  "notes": "Editable strategy candidates. AI can add, remove, or adjust weights after each archived backtest round.",
+  "notes": "Updated by strategy_iteration_loop.py after run 20260526155355.",
   "strategies": [
     {
       "name": "low_price_core",
-      "weights": {"low_price": 0.35, "price_band": 0.25, "low_volatility": 0.2, "liquidity": 0.2},
+      "weights": {
+        "low_price": 0.35,
+        "price_band": 0.25,
+        "low_volatility": 0.2,
+        "liquidity": 0.2
+      },
       "description": "Low-price defensive core with liquidity support."
     },
     {
       "name": "low_price_liquid",
-      "weights": {"low_price": 0.3, "price_band": 0.2, "liquidity": 0.3, "low_volatility": 0.2},
+      "weights": {
+        "low_price": 0.3,
+        "price_band": 0.2,
+        "liquidity": 0.3,
+        "low_volatility": 0.2
+      },
       "description": "Low-price bonds that are easier to trade."
     },
     {
       "name": "low_price_momentum",
-      "weights": {"price_band": 0.25, "low_price": 0.25, "momentum": 0.2, "trend_filter": 0.15, "liquidity": 0.15},
+      "weights": {
+        "price_band": 0.25,
+        "low_price": 0.25,
+        "momentum": 0.2,
+        "trend_filter": 0.15,
+        "liquidity": 0.15
+      },
       "description": "Cheap bonds with moderate trend confirmation."
     },
     {
       "name": "low_vol_core",
-      "weights": {"low_volatility": 0.4, "low_amplitude": 0.25, "liquidity": 0.2, "price_band": 0.15},
+      "weights": {
+        "low_volatility": 0.4,
+        "low_amplitude": 0.25,
+        "liquidity": 0.2,
+        "price_band": 0.15
+      },
       "description": "Low-volatility defensive rotation."
     },
     {
       "name": "balanced_defensive",
-      "weights": {"price_band": 0.25, "low_volatility": 0.2, "liquidity": 0.2, "drawdown_control": 0.2, "momentum": 0.15},
+      "weights": {
+        "price_band": 0.25,
+        "low_volatility": 0.2,
+        "liquidity": 0.2,
+        "drawdown_control": 0.2,
+        "momentum": 0.15
+      },
       "description": "Balanced low price, low volatility, liquidity, and trend."
     },
     {
       "name": "liquid_low_vol",
-      "weights": {"liquidity": 0.3, "liquidity_stability": 0.2, "low_volatility": 0.3, "price_band": 0.2},
+      "weights": {
+        "liquidity": 0.3,
+        "liquidity_stability": 0.2,
+        "low_volatility": 0.3,
+        "price_band": 0.2
+      },
       "description": "Liquid names with volatility control."
     },
     {
       "name": "reversal_defensive",
-      "weights": {"short_reversal": 0.25, "drawdown_control": 0.25, "low_volatility": 0.2, "price_band": 0.2, "liquidity": 0.1},
+      "weights": {
+        "short_reversal": 0.25,
+        "drawdown_control": 0.25,
+        "low_volatility": 0.2,
+        "price_band": 0.2,
+        "liquidity": 0.1
+      },
       "description": "Defensive short-term reversal."
     },
     {
       "name": "drawdown_guard",
-      "weights": {"drawdown_control": 0.35, "low_volatility": 0.25, "price_band": 0.2, "liquidity": 0.2},
+      "weights": {
+        "drawdown_control": 0.35,
+        "low_volatility": 0.25,
+        "price_band": 0.2,
+        "liquidity": 0.2
+      },
       "description": "Avoids bonds in deeper recent drawdown while keeping price and liquidity discipline."
     },
     {
       "name": "stable_liquidity",
-      "weights": {"liquidity_stability": 0.3, "liquidity": 0.25, "low_amplitude": 0.25, "price_band": 0.2},
+      "weights": {
+        "liquidity_stability": 0.3,
+        "liquidity": 0.25,
+        "low_amplitude": 0.25,
+        "price_band": 0.2
+      },
       "description": "Focuses on stable active bonds with controlled intraday amplitude."
     },
     {
       "name": "trend_band",
-      "weights": {"trend_filter": 0.3, "price_band": 0.25, "momentum": 0.2, "low_volatility": 0.15, "liquidity": 0.1},
+      "weights": {
+        "trend_filter": 0.3,
+        "price_band": 0.25,
+        "momentum": 0.2,
+        "low_volatility": 0.15,
+        "liquidity": 0.1
+      },
       "description": "Preferred price band plus trend confirmation."
     },
     {
       "name": "double_low_core",
-      "weights": {"double_low": 0.4, "price_band": 0.2, "liquidity": 0.2, "force_redeem_safety": 0.2},
+      "weights": {
+        "double_low": 0.4,
+        "price_band": 0.2,
+        "liquidity": 0.2,
+        "force_redeem_safety": 0.2
+      },
       "description": "Double-low style ranking when premium data is available."
     },
     {
       "name": "premium_defensive",
-      "weights": {"conversion_premium": 0.35, "low_volatility": 0.2, "price_band": 0.2, "remaining_size": 0.15, "force_redeem_safety": 0.1},
+      "weights": {
+        "conversion_premium": 0.35,
+        "low_volatility": 0.2,
+        "price_band": 0.2,
+        "remaining_size": 0.15,
+        "force_redeem_safety": 0.1
+      },
       "description": "Lower premium with defensive liquidity and redemption-risk controls."
     },
     {
       "name": "ytm_size_defensive",
-      "weights": {"ytm": 0.25, "remaining_size": 0.25, "low_volatility": 0.2, "price_band": 0.2, "rating_score": 0.1},
+      "weights": {
+        "ytm": 0.25,
+        "remaining_size": 0.25,
+        "low_volatility": 0.2,
+        "price_band": 0.2,
+        "rating_score": 0.1
+      },
       "description": "Yield, size, rating, and low-volatility defensive mix."
     },
     {
       "name": "stock_confirmed",
-      "weights": {"stock_momentum": 0.25, "stock_volatility": 0.2, "price_band": 0.2, "conversion_premium": 0.2, "liquidity": 0.15},
+      "weights": {
+        "stock_momentum": 0.25,
+        "stock_volatility": 0.2,
+        "price_band": 0.2,
+        "conversion_premium": 0.2,
+        "liquidity": 0.15
+      },
       "description": "Uses underlying-stock confirmation when stock codes are available."
     },
     {
       "name": "consistency_trend",
-      "weights": {"up_day_consistency": 0.25, "low_downside_volatility": 0.25, "trend_filter": 0.2, "price_band": 0.15, "liquidity": 0.15},
+      "weights": {
+        "up_day_consistency": 0.25,
+        "low_downside_volatility": 0.25,
+        "trend_filter": 0.2,
+        "price_band": 0.15,
+        "liquidity": 0.15
+      },
       "description": "Steady positive days, controlled downside, and a modest trend."
     },
     {
       "name": "tail_guard",
-      "weights": {"tail_loss_control": 0.3, "low_downside_volatility": 0.25, "drawdown_control": 0.2, "low_amplitude": 0.15, "liquidity": 0.1},
+      "weights": {
+        "tail_loss_control": 0.3,
+        "low_downside_volatility": 0.25,
+        "drawdown_control": 0.2,
+        "low_amplitude": 0.15,
+        "liquidity": 0.1
+      },
       "description": "Avoids bonds with jumpy amplitude, large downside tails, and poor drawdown behavior."
     },
     {
       "name": "liquidity_acceleration",
-      "weights": {"liquidity_trend": 0.3, "volume_trend": 0.2, "liquidity_stability": 0.15, "low_volatility": 0.2, "price_band": 0.15},
+      "weights": {
+        "liquidity_trend": 0.3,
+        "volume_trend": 0.2,
+        "liquidity_stability": 0.15,
+        "low_volatility": 0.2,
+        "price_band": 0.15
+      },
       "description": "Improving liquidity without giving up price and volatility discipline."
     },
     {
       "name": "channel_recovery",
-      "weights": {"price_position": 0.25, "short_reversal": 0.2, "trend_filter": 0.2, "low_gap_risk": 0.2, "liquidity": 0.15},
+      "weights": {
+        "price_position": 0.25,
+        "short_reversal": 0.2,
+        "trend_filter": 0.2,
+        "low_gap_risk": 0.2,
+        "liquidity": 0.15
+      },
       "description": "Recovery inside the recent price channel with controlled gap risk."
     },
     {
       "name": "maturity_defensive",
-      "weights": {"remaining_years": 0.2, "remaining_size": 0.2, "ytm": 0.2, "price_band": 0.25, "low_volatility": 0.15},
+      "weights": {
+        "remaining_years": 0.2,
+        "remaining_size": 0.2,
+        "ytm": 0.2,
+        "price_band": 0.25,
+        "low_volatility": 0.15
+      },
       "description": "Remaining-term, size, YTM, and price-band defenses."
+    },
+    {
+      "name": "ai_r1_return_1_consistency_trend",
+      "weights": {
+        "liquidity": 0.1452,
+        "liquidity_trend": 0.0242,
+        "low_downside_volatility": 0.2016,
+        "momentum": 0.0403,
+        "price_band": 0.121,
+        "price_position": 0.0323,
+        "trend_filter": 0.2016,
+        "up_day_consistency": 0.2339
+      },
+      "description": "AI iteration 1: return variant based on consistency_trend."
+    },
+    {
+      "name": "ai_r1_return_3_channel_recovery",
+      "weights": {
+        "liquidity": 0.1452,
+        "liquidity_trend": 0.0242,
+        "low_gap_risk": 0.1613,
+        "momentum": 0.0403,
+        "price_position": 0.2339,
+        "short_reversal": 0.1613,
+        "trend_filter": 0.2016,
+        "up_day_consistency": 0.0323
+      },
+      "description": "AI iteration 1: return variant based on channel_recovery."
+    },
+    {
+      "name": "ai_r1_return_4_tail_guard",
+      "weights": {
+        "drawdown_control": 0.1613,
+        "liquidity": 0.1048,
+        "liquidity_trend": 0.0242,
+        "low_amplitude": 0.121,
+        "low_downside_volatility": 0.2016,
+        "momentum": 0.0403,
+        "price_position": 0.0323,
+        "tail_loss_control": 0.2419,
+        "trend_filter": 0.0403,
+        "up_day_consistency": 0.0323
+      },
+      "description": "AI iteration 1: return variant based on tail_guard."
+    },
+    {
+      "name": "ai_r1_return_1_trend_band",
+      "weights": {
+        "liquidity": 0.1048,
+        "liquidity_trend": 0.0242,
+        "low_volatility": 0.121,
+        "momentum": 0.2016,
+        "price_band": 0.2016,
+        "price_position": 0.0323,
+        "trend_filter": 0.2823,
+        "up_day_consistency": 0.0323
+      },
+      "description": "AI iteration 1: return variant based on trend_band."
+    },
+    {
+      "name": "ai_r1_return_4_ai_r1_return_3_channel_recovery",
+      "weights": {
+        "liquidity": 0.1413,
+        "liquidity_trend": 0.0437,
+        "low_gap_risk": 0.1301,
+        "momentum": 0.0728,
+        "price_position": 0.2209,
+        "short_reversal": 0.1301,
+        "trend_filter": 0.2029,
+        "up_day_consistency": 0.0583
+      },
+      "description": "AI iteration 1: return variant based on ai_r1_return_3_channel_recovery."
     }
   ]
 }
