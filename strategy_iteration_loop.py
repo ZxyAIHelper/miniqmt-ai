@@ -53,7 +53,8 @@ WEAK_OR_UNAVAILABLE_FACTORS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Iteratively run MiniQMT CB optimization and evolve strategy candidates.")
-    parser.add_argument("--rounds", type=int, default=3, help="Maximum AI iteration rounds.")
+    parser.add_argument("--rounds", type=int, default=0, help="Manual round cap. 0 means keep running until the AI stop decision.")
+    parser.add_argument("--safety-max-rounds", type=int, default=100, help="Emergency guard for --rounds 0 to avoid accidental endless execution.")
     parser.add_argument("--patience", type=int, default=2, help="Stop after this many rounds without meaningful improvement.")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit", type=int, default=20, help="Convertible-bond universe limit for each round. 0 means full universe.")
@@ -335,8 +336,10 @@ def main() -> int:
         stop, _decision = analyze_and_update(args, run_dir, 1)
         return 0 if stop else 1
 
-    for round_index in range(1, args.rounds + 1):
-        print(f"iteration_round={round_index}/{args.rounds}", flush=True)
+    round_cap = args.rounds if args.rounds > 0 else args.safety_max_rounds
+    round_label = str(args.rounds) if args.rounds > 0 else "AI_STOP"
+    for round_index in range(1, round_cap + 1):
+        print(f"iteration_round={round_index}/{round_label}", flush=True)
         returncode, run_dir = run_backtest_round(args)
         print(f"round_returncode={returncode}", flush=True)
         if run_dir is None:
@@ -344,7 +347,10 @@ def main() -> int:
         stop, _decision = analyze_and_update(args, run_dir, round_index)
         if stop:
             return 0
-    print("ai_stop_reason=Reached maximum configured rounds.", flush=True)
+    if args.rounds > 0:
+        print("ai_stop_reason=Reached manual round cap before AI stopped.", flush=True)
+    else:
+        print("ai_stop_reason=Reached safety max rounds before AI stopped.", flush=True)
     return 0
 
 

@@ -29,16 +29,18 @@ python miniqmt_cb_backtest.py --optimize --workers 8
 Run the iterative AI research loop:
 
 ```powershell
-python strategy_iteration_loop.py --rounds 3 --workers 8 --limit 0
+python strategy_iteration_loop.py --workers 8 --limit 0
 ```
 
 `strategy_iteration_loop.py` launches one MiniQMT optimization round, reads the
 archived search result, writes a Codex review prompt under
 `qmt_outputs/ai_reviews/`, updates `strategy_candidates.json` when the analysis
-finds useful new variants, and stops when the recent search history appears to
-have plateaued. The stop condition is research-oriented: no useful new strategy
-weights, a passed candidate needing human review, or insufficient improvement
-over the configured patience window.
+finds useful new variants, then starts the next round automatically. By default
+`--rounds 0` means there is no research-round target; the loop stops only when
+the AI decision says there is no useful next strategy to try. `--safety-max-rounds`
+is an emergency guard only. The stop condition is research-oriented: no useful
+new strategy weights, a passed candidate needing human review, or insufficient
+improvement over the configured patience window.
 
 The script:
 
