@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -19,6 +20,7 @@ AI_DIR = OUTPUT_DIR / "ai_reviews"
 HISTORY_FILE = OUTPUT_DIR / "ai_strategy_iterations.jsonl"
 DEFAULT_STRATEGY_FILE = BASE_DIR / "strategy_candidates.json"
 BACKTEST_SCRIPT = BASE_DIR / "miniqmt_cb_backtest.py"
+CODEX_DECISION_SCHEMA = BASE_DIR / "codex_strategy_decision.schema.json"
 
 DEFENSIVE_FACTORS = {
     "price_band": 0.06,
@@ -61,6 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy-file", default=str(DEFAULT_STRATEGY_FILE))
     parser.add_argument("--min-improvement", type=float, default=0.01, help="Minimum rank-score improvement considered meaningful.")
     parser.add_argument("--max-strategies", type=int, default=32, help="Maximum strategies kept for the next round.")
+    parser.add_argument("--ai-provider", choices=["codex", "heuristic"], default="codex", help="Decision agent used after each backtest round.")
+    parser.add_argument("--codex-command", default="codex", help="Codex CLI command.")
+    parser.add_argument("--codex-model", default="", help="Optional model name passed to codex exec.")
+    parser.add_argument("--codex-timeout", type=int, default=900, help="Seconds to wait for the Codex decision agent.")
     parser.add_argument("--dry-run-ai", action="store_true", help="Analyze latest run and propose strategies without launching backtest.")
     return parser.parse_args()
 
@@ -78,6 +84,22 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def read_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def parse_json_text(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start : end + 1])
+        raise
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -133,6 +155,11 @@ def strategy_map(strategy_file: Path) -> dict[str, dict[str, Any]]:
     return {item["name"]: item for item in payload.get("strategies", [])}
 
 
+def factor_definitions(run_dir: Path) -> dict[str, str]:
+    rows = read_csv(run_dir / "cb_factor_definitions.csv")
+    return {row.get("factor", ""): row.get("description", "") for row in rows if row.get("factor")}
+
+
 def sorted_results(run_dir: Path) -> list[dict[str, str]]:
     rows = read_csv(run_dir / "cb_strategy_search.csv")
     rows.sort(key=lambda row: safe_float(row.get("rank_score"), -999.0), reverse=True)
@@ -176,6 +203,72 @@ def normalize_weights(weights: dict[str, float]) -> dict[str, float]:
     if total <= 0:
         return {}
     return {factor: round(weight / total, 4) for factor, weight in sorted(cleaned.items())}
+
+
+def validate_agent_strategies(strategies: Any, allowed_factors: set[str], existing_names: set[str]) -> list[dict[str, Any]]:
+    if not isinstance(strategies, list):
+        raise ValueError("Agent decision field 'strategies' must be a list.")
+    cleaned = []
+    seen = set(existing_names)
+    for index, item in enumerate(strategies, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Agent strategy #{index} is not an object.")
+        raw_name = str(item.get("name", "")).strip()
+        if not raw_name:
+            raise ValueError(f"Agent strategy #{index} has no name.")
+        name = "".join(ch if ch.isalnum() or ch in ["_", "-"] else "_" for ch in raw_name)[:64]
+        base_name = name
+        suffix = 2
+        while name in seen:
+            name = f"{base_name[:58]}_{suffix}"
+            suffix += 1
+        weights = item.get("weights", {})
+        if isinstance(weights, list):
+            weights = {
+                str(weight_item.get("factor", "")).strip(): weight_item.get("weight")
+                for weight_item in weights
+                if isinstance(weight_item, dict)
+            }
+        if not isinstance(weights, dict) or not weights:
+            raise ValueError(f"Agent strategy {raw_name} has no weights.")
+        cleaned_weights = {}
+        for factor, weight in weights.items():
+            factor_name = str(factor).strip()
+            if factor_name not in allowed_factors:
+                raise ValueError(f"Agent strategy {raw_name} uses unknown factor: {factor_name}")
+            factor_weight = safe_float(weight, math.nan)
+            if not math.isfinite(factor_weight) or factor_weight <= 0:
+                raise ValueError(f"Agent strategy {raw_name} has invalid weight for {factor_name}: {weight}")
+            cleaned_weights[factor_name] = factor_weight
+        normalized = normalize_weights(cleaned_weights)
+        if not normalized:
+            raise ValueError(f"Agent strategy {raw_name} has no usable positive weights.")
+        seen.add(name)
+        cleaned.append({
+            "name": name,
+            "weights": normalized,
+            "description": str(item.get("description", "")).strip() or f"Codex generated strategy {name}.",
+        })
+    return cleaned
+
+
+def merge_strategy_pool(current: dict[str, dict[str, Any]], proposed: list[dict[str, Any]], max_strategies: int) -> list[dict[str, Any]]:
+    combined = list(current.values()) + proposed
+    signatures = set()
+    deduped = []
+    for item in combined:
+        item_signature = signature(item.get("weights", {}))
+        if item_signature in signatures:
+            continue
+        signatures.add(item_signature)
+        deduped.append(item)
+    if len(deduped) <= max_strategies:
+        return deduped
+    original_names = set(current)
+    originals = [item for item in deduped if item["name"] in original_names]
+    new_items = [item for item in deduped if item["name"] not in original_names]
+    kept_originals = originals[-max(0, max_strategies - len(new_items)) :]
+    return (kept_originals + new_items)[-max_strategies:]
 
 
 def adjusted_weights(base: dict[str, float], additions: dict[str, float], cuts: set[str]) -> dict[str, float]:
@@ -261,30 +354,121 @@ def should_stop(history: list[dict[str, Any]], summary: dict[str, Any], patience
     return False, "Improvement is still meaningful enough to continue."
 
 
-def write_prompt(run_dir: Path, summary: dict[str, Any], strategy_file: Path, decision: dict[str, Any]) -> Path:
-    prompt_path = AI_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_codex_prompt.md"
-    lines = [
-        "# Convertible Bond Strategy Iteration",
-        "",
-        "You are Codex reviewing a MiniQMT convertible-bond strategy search round.",
-        "Decide whether to continue and, if continuing, propose new factor-weight strategies as JSON.",
-        "",
-        f"Run dir: {run_dir}",
-        f"Strategy file: {strategy_file}",
-        "",
-        "## Summary",
-        "```json",
-        json.dumps(summary, ensure_ascii=False, indent=2),
-        "```",
-        "",
-        "## Current Decision",
-        "```json",
-        json.dumps(decision, ensure_ascii=False, indent=2),
-        "```",
+def build_agent_prompt(run_dir: Path, strategy_file: Path, summary: dict[str, Any], current: dict[str, dict[str, Any]], history: list[dict[str, Any]]) -> str:
+    factors = factor_definitions(run_dir)
+    recent_history = [
+        {
+            "run_dir": item.get("run_dir"),
+            "best_rank_score": item.get("summary", {}).get("best_rank_score"),
+            "best_strategy": item.get("summary", {}).get("best_strategy"),
+            "passed": item.get("summary", {}).get("passed"),
+            "stop": item.get("stop"),
+            "reason": item.get("reason"),
+        }
+        for item in history[-6:]
     ]
+    current_strategies = list(current.values())
+    return "\n".join([
+        "# Convertible Bond Strategy Agent",
+        "",
+        "You are a Codex strategy research agent for a MiniQMT convertible-bond backtest loop.",
+        "Your job is to decide whether the search should continue and, only if useful, propose new factor-weight strategies.",
+        "",
+        "Return exactly the JSON object required by the provided output schema.",
+        "",
+        "Rules:",
+        "- Do not edit files or run commands.",
+        "- Set stop=true when the history suggests further factor-weight tweaks are unlikely to add value.",
+        "- Set stop=false only when you can propose genuinely different strategy candidates.",
+        "- Use only factors listed in available_factors.",
+        "- Each strategy should use 3 to 8 factors with positive weights. Return weights as an array of {factor, weight}; the controller will normalize them.",
+        "- Avoid factors marked unavailable_or_weak unless the results strongly justify them.",
+        "- Prefer a small number of high-quality new strategies, usually 1 to 5.",
+        "- Consider max drawdown, annual return, Calmar, monthly win rate, max monthly loss, trade count, and repeated lack of improvement.",
+        "",
+        "Context JSON:",
+        "```json",
+        json.dumps({
+            "run_dir": str(run_dir),
+            "strategy_file": str(strategy_file),
+            "available_factors": factors,
+            "unavailable_or_weak_factors": sorted(WEAK_OR_UNAVAILABLE_FACTORS),
+            "latest_summary": summary,
+            "recent_iteration_history": recent_history,
+            "current_strategy_count": len(current_strategies),
+            "current_strategies": current_strategies,
+        }, ensure_ascii=False, indent=2),
+        "```",
+    ])
+
+
+def write_prompt(run_dir: Path, prompt_text: str) -> Path:
+    prompt_path = AI_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_codex_prompt.md"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_path.write_text("\n".join(lines), encoding="utf-8")
+    prompt_path.write_text(prompt_text, encoding="utf-8")
     return prompt_path
+
+
+def call_codex_agent(args: argparse.Namespace, prompt_text: str, run_dir: Path) -> dict[str, Any]:
+    output_path = AI_DIR / f"{run_dir.name}_codex_response.json"
+    stderr_path = AI_DIR / f"{run_dir.name}_codex_stderr.txt"
+    codex_command = args.codex_command
+    if os.name == "nt" and not Path(codex_command).suffix:
+        codex_command = shutil.which(f"{codex_command}.cmd") or shutil.which(codex_command) or codex_command
+    command = [
+        codex_command,
+        "-a",
+        "never",
+        "exec",
+        "--cd",
+        str(BASE_DIR),
+        "--sandbox",
+        "read-only",
+        "--output-schema",
+        str(CODEX_DECISION_SCHEMA),
+        "--output-last-message",
+        str(output_path),
+        "-",
+    ]
+    if args.codex_model:
+        command[2:2] = ["--model", args.codex_model]
+    AI_DIR.mkdir(parents=True, exist_ok=True)
+    print("launch_codex_agent=" + " ".join(command), flush=True)
+    completed = subprocess.run(
+        command,
+        cwd=str(BASE_DIR),
+        input=prompt_text,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=args.codex_timeout,
+    )
+    stderr_path.write_text((completed.stdout or "") + "\n--- STDERR ---\n" + (completed.stderr or ""), encoding="utf-8")
+    if completed.returncode != 0:
+        raise RuntimeError(f"Codex agent failed with exit code {completed.returncode}. See {stderr_path}")
+    if not output_path.exists():
+        raise RuntimeError(f"Codex agent did not write {output_path}")
+    decision = parse_json_text(output_path.read_text(encoding="utf-8"))
+    if not isinstance(decision.get("stop"), bool):
+        raise ValueError("Codex decision must contain boolean stop.")
+    if not isinstance(decision.get("reason"), str):
+        raise ValueError("Codex decision must contain string reason.")
+    if "strategies" not in decision:
+        raise ValueError("Codex decision must contain strategies.")
+    return decision
+
+
+def heuristic_decision(current: dict[str, dict[str, Any]], summary: dict[str, Any], history: list[dict[str, Any]], args: argparse.Namespace, round_index: int) -> dict[str, Any]:
+    next_strategies = generate_candidates(current, summary, round_index, args.max_strategies)
+    proposed_count = max(0, len(next_strategies) - len(current))
+    stop, reason = should_stop(history, summary, args.patience, args.min_improvement, proposed_count)
+    proposed_names = set(item["name"] for item in next_strategies) - set(current)
+    return {
+        "stop": stop,
+        "reason": reason,
+        "strategies": [item for item in next_strategies if item["name"] in proposed_names],
+    }
 
 
 def analyze_and_update(args: argparse.Namespace, run_dir: Path, round_index: int) -> tuple[bool, dict[str, Any]]:
@@ -292,20 +476,36 @@ def analyze_and_update(args: argparse.Namespace, run_dir: Path, round_index: int
     current = strategy_map(strategy_file)
     rows = sorted_results(run_dir)
     summary = summarize_results(rows)
-    next_strategies = generate_candidates(current, summary, round_index, args.max_strategies)
-    proposed_count = max(0, len(next_strategies) - len(current))
     history = previous_history()
-    stop, reason = should_stop(history, summary, args.patience, args.min_improvement, proposed_count)
+    prompt_text = build_agent_prompt(run_dir, strategy_file, summary, current, history)
+    prompt_path = write_prompt(run_dir, prompt_text)
+    if args.ai_provider == "codex":
+        agent_response = call_codex_agent(args, prompt_text, run_dir)
+    else:
+        agent_response = heuristic_decision(current, summary, history, args, round_index)
+
+    allowed_factors = set(factor_definitions(run_dir))
+    proposed = validate_agent_strategies(agent_response.get("strategies", []), allowed_factors, set(current))
+    proposed_count = len(proposed)
+    stop = bool(agent_response.get("stop"))
+    reason = str(agent_response.get("reason", "")).strip()
+    if not reason:
+        reason = "Agent did not provide a reason."
+    if not stop and proposed_count <= 0:
+        stop = True
+        reason = "Agent chose to continue but did not provide any valid new strategies."
+    next_strategies = merge_strategy_pool(current, proposed, args.max_strategies)
     decision = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "round_index": round_index,
+        "ai_provider": args.ai_provider,
         "run_dir": str(run_dir),
         "summary": summary,
         "proposed_count": proposed_count,
         "stop": stop,
         "reason": reason,
+        "agent_response": agent_response,
     }
-    prompt_path = write_prompt(run_dir, summary, strategy_file, decision)
     decision["codex_prompt"] = str(prompt_path)
 
     AI_DIR.mkdir(parents=True, exist_ok=True)
@@ -334,7 +534,8 @@ def main() -> int:
         if run_dir is None:
             raise RuntimeError("No archived run is available for dry-run AI analysis.")
         stop, _decision = analyze_and_update(args, run_dir, 1)
-        return 0 if stop else 1
+        print(f"dry_run_ai_stop={stop}", flush=True)
+        return 0
 
     round_cap = args.rounds if args.rounds > 0 else args.safety_max_rounds
     round_label = str(args.rounds) if args.rounds > 0 else "AI_STOP"

@@ -3,47 +3,6 @@
   "notes": "Updated by strategy_iteration_loop.py after run 20260526155355.",
   "strategies": [
     {
-      "name": "low_price_core",
-      "weights": {
-        "low_price": 0.35,
-        "price_band": 0.25,
-        "low_volatility": 0.2,
-        "liquidity": 0.2
-      },
-      "description": "Low-price defensive core with liquidity support."
-    },
-    {
-      "name": "low_price_liquid",
-      "weights": {
-        "low_price": 0.3,
-        "price_band": 0.2,
-        "liquidity": 0.3,
-        "low_volatility": 0.2
-      },
-      "description": "Low-price bonds that are easier to trade."
-    },
-    {
-      "name": "low_price_momentum",
-      "weights": {
-        "price_band": 0.25,
-        "low_price": 0.25,
-        "momentum": 0.2,
-        "trend_filter": 0.15,
-        "liquidity": 0.15
-      },
-      "description": "Cheap bonds with moderate trend confirmation."
-    },
-    {
-      "name": "low_vol_core",
-      "weights": {
-        "low_volatility": 0.4,
-        "low_amplitude": 0.25,
-        "liquidity": 0.2,
-        "price_band": 0.15
-      },
-      "description": "Low-volatility defensive rotation."
-    },
-    {
       "name": "balanced_defensive",
       "weights": {
         "price_band": 0.25,
@@ -275,6 +234,58 @@
         "up_day_consistency": 0.0583
       },
       "description": "AI iteration 1: return variant based on ai_r1_return_3_channel_recovery."
+    },
+    {
+      "name": "ai_r2_trend_band_tail_control",
+      "weights": {
+        "liquidity": 0.04,
+        "low_downside_volatility": 0.12,
+        "low_volatility": 0.14,
+        "momentum": 0.14,
+        "price_band": 0.22,
+        "tail_loss_control": 0.08,
+        "trend_filter": 0.26
+      },
+      "description": "Keeps the successful trend_band core but shifts some momentum exposure into downside and tail-risk controls to improve drawdown and monthly loss behavior."
+    },
+    {
+      "name": "ai_r2_trend_consistency_band",
+      "weights": {
+        "drawdown_control": 0.04,
+        "liquidity": 0.08,
+        "low_downside_volatility": 0.15,
+        "momentum": 0.11,
+        "price_band": 0.2,
+        "trend_filter": 0.24,
+        "up_day_consistency": 0.18
+      },
+      "description": "A trend-band variant aimed at improving monthly win rate by combining trend confirmation with up-day consistency and controlled downside volatility."
+    },
+    {
+      "name": "ai_r2_band_gap_drawdown_guard",
+      "weights": {
+        "drawdown_control": 0.17,
+        "liquidity": 0.05,
+        "liquidity_stability": 0.07,
+        "low_gap_risk": 0.14,
+        "low_volatility": 0.12,
+        "price_band": 0.24,
+        "trend_filter": 0.21
+      },
+      "description": "Tests whether the strong low-drawdown trend_band result can be stabilized further with gap-risk and drawdown controls while retaining price-band discipline."
+    },
+    {
+      "name": "ai_r2_channel_trend_low_tail",
+      "weights": {
+        "liquidity": 0.08,
+        "low_gap_risk": 0.1,
+        "price_band": 0.16,
+        "price_position": 0.22,
+        "short_reversal": 0.12,
+        "tail_loss_control": 0.12,
+        "trend_filter": 0.2
+      },
+      "description": "A genuinely different channel-position approach that blends price-channel recovery with trend confirmation and explicit tail-risk control."
     }
   ]
 }

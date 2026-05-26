@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "stop": {
+      "type": "boolean",
+      "description": "True when further strategy search is unlikely to be useful."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Concise explanation for stopping or continuing."
+    },
+    "strategies": {
+      "type": "array",
+      "description": "New strategy candidates to try next. Empty when stop is true.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "weights": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "factor": {
+                  "type": "string"
+                },
+                "weight": {
+                  "type": "number"
+                }
+              },
+              "required": ["factor", "weight"]
+            }
+          }
+        },
+        "required": ["name", "description", "weights"]
+      }
+    }
+  },
+  "required": ["stop", "reason", "strategies"]
+}

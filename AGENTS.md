@@ -34,13 +34,13 @@ python strategy_iteration_loop.py --workers 8 --limit 0
 
 `strategy_iteration_loop.py` launches one MiniQMT optimization round, reads the
 archived search result, writes a Codex review prompt under
-`qmt_outputs/ai_reviews/`, updates `strategy_candidates.json` when the analysis
-finds useful new variants, then starts the next round automatically. By default
-`--rounds 0` means there is no research-round target; the loop stops only when
-the AI decision says there is no useful next strategy to try. `--safety-max-rounds`
-is an emergency guard only. The stop condition is research-oriented: no useful
-new strategy weights, a passed candidate needing human review, or insufficient
-improvement over the configured patience window.
+`qmt_outputs/ai_reviews/`, calls `codex exec` as the decision agent, validates
+the agent's JSON response with `codex_strategy_decision.schema.json`, updates
+`strategy_candidates.json` when Codex proposes useful variants, then starts the
+next round automatically. By default `--rounds 0` means there is no
+research-round target; the loop stops only when Codex says there is no useful
+next strategy to try. `--safety-max-rounds` is an emergency guard only. Use
+`--ai-provider heuristic` only as a local fallback when Codex CLI is unavailable.
 
 The script:
 
