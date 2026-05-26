@@ -42,6 +42,16 @@ research-round target; the loop stops only when Codex says there is no useful
 next strategy to try. `--safety-max-rounds` is an emergency guard only. Use
 `--ai-provider heuristic` only as a local fallback when Codex CLI is unavailable.
 
+Run the local results dashboard:
+
+```powershell
+python qmt_dashboard.py --host 127.0.0.1 --port 8765
+```
+
+Open `http://127.0.0.1:8765` to inspect archived optimization rounds, overall
+metrics, individual strategy rows, factor weights, and to launch a single
+strategy re-backtest with the selected row's parameters.
+
 The script:
 
 - connects to local MiniQMT through `xtquant.xtdata`;
