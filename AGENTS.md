@@ -52,6 +52,11 @@ Downloaded daily bars are stored in `.qmt_cache/miniqmt_cb_history.sqlite3`.
 Repeated runs read from SQLite and only request missing date ranges per bond
 from MiniQMT, so daily runs only need to sync incremental updates.
 
+Convertible-bond metadata is stored in the same SQLite database. The current
+factor set includes price, volatility, liquidity, drawdown, price-channel,
+downside-risk, maturity, size, forced-redemption, and optional conversion or
+underlying-stock factors when MiniQMT provides the needed fields.
+
 ## Required Local Config
 
 `config.py` stores local MiniQMT settings, especially `QMT_USER_DATA_PATH`.

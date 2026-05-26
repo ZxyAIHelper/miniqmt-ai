@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
 import sqlite3
@@ -34,6 +35,7 @@ RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
 
 WORKER_DATA: dict[str, pd.DataFrame] | None = None
 WORKER_ARGS: argparse.Namespace | None = None
+WORKER_STOCK_DATA: dict[str, pd.DataFrame] | None = None
 
 
 STRATEGY_DEFINITIONS = {
@@ -57,6 +59,24 @@ FACTOR_DESCRIPTIONS = {
     "drawdown_control": "Negative recent peak-to-current drawdown; higher avoids names falling far from recent highs.",
     "trend_filter": "Close price above moving average; higher favors healthier trend.",
     "low_amplitude": "Negative high-low amplitude; higher avoids jumpy bonds.",
+    "up_day_consistency": "Share of positive return days in the lookback window.",
+    "low_downside_volatility": "Negative volatility of losing days only; higher avoids downside turbulence.",
+    "tail_loss_control": "Negative worst one-day return in the lookback window.",
+    "liquidity_trend": "Recent turnover amount versus the full lookback average.",
+    "volume_trend": "Recent volume versus the full lookback average.",
+    "price_position": "Close position inside the recent high-low channel.",
+    "low_gap_risk": "Negative average open-to-previous-close gap risk.",
+    "conversion_premium": "Negative conversion premium rate when MiniQMT provides it; lower premium is better.",
+    "double_low": "Negative price plus premium proxy; lower double-low value is better.",
+    "conversion_value": "Estimated conversion value from stock price and conversion price; higher is better.",
+    "ytm": "Yield to maturity when available; higher is better.",
+    "remaining_years": "Remaining maturity years; moderate/longer duration is preferred.",
+    "remaining_size": "Remaining issue size proxy; avoids tiny illiquid bonds.",
+    "listed_days": "Listed days; avoids very new bonds.",
+    "force_redeem_safety": "Penalty for near or announced forced redemption risk.",
+    "rating_score": "Credit rating score when available.",
+    "stock_momentum": "Underlying stock momentum when stock code is available.",
+    "stock_volatility": "Negative underlying stock volatility when stock code is available.",
 }
 
 
@@ -110,6 +130,51 @@ GENERATED_STRATEGIES = [
         "name": "trend_band",
         "weights": {"trend_filter": 0.30, "price_band": 0.25, "momentum": 0.20, "low_volatility": 0.15, "liquidity": 0.10},
         "description": "Preferred price band plus trend confirmation.",
+    },
+    {
+        "name": "double_low_core",
+        "weights": {"double_low": 0.40, "price_band": 0.20, "liquidity": 0.20, "force_redeem_safety": 0.20},
+        "description": "Double-low style ranking when premium data is available.",
+    },
+    {
+        "name": "premium_defensive",
+        "weights": {"conversion_premium": 0.35, "low_volatility": 0.20, "price_band": 0.20, "remaining_size": 0.15, "force_redeem_safety": 0.10},
+        "description": "Lower premium with defensive liquidity and redemption-risk controls.",
+    },
+    {
+        "name": "ytm_size_defensive",
+        "weights": {"ytm": 0.25, "remaining_size": 0.25, "low_volatility": 0.20, "price_band": 0.20, "rating_score": 0.10},
+        "description": "Yield, size, rating, and low-volatility defensive mix.",
+    },
+    {
+        "name": "stock_confirmed",
+        "weights": {"stock_momentum": 0.25, "stock_volatility": 0.20, "price_band": 0.20, "conversion_premium": 0.20, "liquidity": 0.15},
+        "description": "Uses underlying-stock confirmation when stock codes are available.",
+    },
+    {
+        "name": "consistency_trend",
+        "weights": {"up_day_consistency": 0.25, "low_downside_volatility": 0.25, "trend_filter": 0.20, "price_band": 0.15, "liquidity": 0.15},
+        "description": "Steady positive days, controlled downside, and a modest trend.",
+    },
+    {
+        "name": "tail_guard",
+        "weights": {"tail_loss_control": 0.30, "low_downside_volatility": 0.25, "drawdown_control": 0.20, "low_amplitude": 0.15, "liquidity": 0.10},
+        "description": "Avoids bonds with jumpy amplitude, large downside tails, and poor drawdown behavior.",
+    },
+    {
+        "name": "liquidity_acceleration",
+        "weights": {"liquidity_trend": 0.30, "volume_trend": 0.20, "liquidity_stability": 0.15, "low_volatility": 0.20, "price_band": 0.15},
+        "description": "Improving liquidity without giving up price and volatility discipline.",
+    },
+    {
+        "name": "channel_recovery",
+        "weights": {"price_position": 0.25, "short_reversal": 0.20, "trend_filter": 0.20, "low_gap_risk": 0.20, "liquidity": 0.15},
+        "description": "Recovery inside the recent price channel with controlled gap risk.",
+    },
+    {
+        "name": "maturity_defensive",
+        "weights": {"remaining_years": 0.20, "remaining_size": 0.20, "ytm": 0.20, "price_band": 0.25, "low_volatility": 0.15},
+        "description": "Remaining-term, size, YTM, and price-band defenses.",
     },
 ]
 
@@ -171,6 +236,46 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def first_value(data: dict[str, Any], keys: list[str], default: Any = None) -> Any:
+    for key in keys:
+        if key in data and data.get(key) not in [None, ""]:
+            return data.get(key)
+    return default
+
+
+def normalize_yyyymmdd(value: Any) -> str:
+    try:
+        text = str(int(float(value)))
+    except Exception:
+        return ""
+    if len(text) >= 8 and "1970010" not in text and text not in ["0", "99999999"]:
+        return text[:8]
+    return ""
+
+
+def rating_to_score(rating: str) -> float:
+    order = ["C", "CC", "CCC", "B-", "B", "B+", "BB-", "BB", "BB+", "BBB-", "BBB", "BBB+", "A-", "A", "A+", "AA-", "AA", "AA+", "AAA"]
+    rating = safe_text(rating).strip().upper()
+    if rating not in order:
+        return 0.0
+    return order.index(rating) / max(len(order) - 1, 1)
+
+
+def days_between(start: str, end: str) -> int:
+    try:
+        d1 = datetime.strptime(start[:8], "%Y%m%d")
+        d2 = datetime.strptime(end[:8], "%Y%m%d")
+        return (d2 - d1).days
+    except Exception:
+        return 0
+
+
 def is_cb_code(code: str) -> bool:
     code = str(code)
     return code.endswith((".SH", ".SZ")) and code[:3] in ["110", "111", "113", "118", "123", "127", "128"]
@@ -214,6 +319,26 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cb_metadata (
+            code TEXT PRIMARY KEY,
+            name TEXT,
+            stock_code TEXT,
+            list_date TEXT,
+            maturity_date TEXT,
+            force_redeem_date TEXT,
+            force_redeem_status TEXT,
+            conv_price REAL,
+            conversion_premium REAL,
+            ytm REAL,
+            remaining_size REAL,
+            rating TEXT,
+            raw_json TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -245,6 +370,113 @@ def mark_synced(conn: sqlite3.Connection, code: str, end: str) -> None:
         """,
         (code, end, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     )
+
+
+def normalize_conversion_premium(value: Any) -> float:
+    number = safe_float(value, 0.0)
+    if abs(number) > 3.0:
+        number = number / 100.0
+    return number
+
+
+def sync_cb_metadata(xtdata: Any, conn: sqlite3.Connection, codes: list[str]) -> None:
+    rows = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for idx, code in enumerate(codes, 1):
+        info: dict[str, Any] = {}
+        detail: dict[str, Any] = {}
+        try:
+            info = xtdata.get_cb_info(code) or {}
+        except Exception:
+            info = {}
+        try:
+            detail = xtdata.get_instrument_detail(code) or {}
+        except Exception:
+            detail = {}
+        merged = {**detail, **info}
+        stock_code = safe_text(first_value(merged, ["stockCode", "StockCode", "underlyingCode"], ""))
+        rows.append((
+            code,
+            safe_text(first_value(merged, ["bondName", "InstrumentName", "instrumentName", "Name"], "")),
+            stock_code if is_stock_code(stock_code) else "",
+            normalize_yyyymmdd(first_value(merged, ["bondListDate", "OpenDate", "openDate"], "")),
+            normalize_yyyymmdd(first_value(merged, ["bondMaturityDate", "ExpireDate", "expireDate", "delistDate"], "")),
+            normalize_yyyymmdd(first_value(merged, ["forceRedeemTradeDate", "forceRedeemDate"], "")),
+            safe_text(first_value(merged, ["redeemStatus", "forceRedeemStatus"], "")),
+            safe_float(first_value(merged, ["bondConvPrice", "convPrice", "conversionPrice"], 0.0), 0.0),
+            normalize_conversion_premium(first_value(merged, ["analConvpremiumratio", "convPremiumRatio", "conversionPremiumRate"], 0.0)),
+            safe_float(first_value(merged, ["ytm", "analYTM"], 0.0), 0.0),
+            safe_float(first_value(merged, ["bondReMainSize", "remainSize", "FloatVolume", "bondIssueSize", "TotalVolume"], 0.0), 0.0),
+            safe_text(first_value(merged, ["level", "rating"], "")),
+            json.dumps(merged, ensure_ascii=False, default=str),
+            now,
+        ))
+        if idx % 50 == 0 or idx == len(codes):
+            print(f"metadata_sync_progress={idx}/{len(codes)}", flush=True)
+
+    conn.executemany(
+        """
+        INSERT INTO cb_metadata (
+            code, name, stock_code, list_date, maturity_date, force_redeem_date,
+            force_redeem_status, conv_price, conversion_premium, ytm, remaining_size,
+            rating, raw_json, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            name=excluded.name,
+            stock_code=excluded.stock_code,
+            list_date=excluded.list_date,
+            maturity_date=excluded.maturity_date,
+            force_redeem_date=excluded.force_redeem_date,
+            force_redeem_status=excluded.force_redeem_status,
+            conv_price=excluded.conv_price,
+            conversion_premium=excluded.conversion_premium,
+            ytm=excluded.ytm,
+            remaining_size=excluded.remaining_size,
+            rating=excluded.rating,
+            raw_json=excluded.raw_json,
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def load_metadata(conn: sqlite3.Connection, codes: list[str]) -> dict[str, dict[str, Any]]:
+    if not codes:
+        return {}
+    placeholders = ",".join("?" for _ in codes)
+    rows = conn.execute(
+        f"""
+        SELECT code, name, stock_code, list_date, maturity_date, force_redeem_date,
+               force_redeem_status, conv_price, conversion_premium, ytm,
+               remaining_size, rating
+        FROM cb_metadata
+        WHERE code IN ({placeholders})
+        """,
+        codes,
+    ).fetchall()
+    result = {}
+    for row in rows:
+        result[row[0]] = {
+            "name": row[1],
+            "stock_code": row[2],
+            "list_date": row[3],
+            "maturity_date": row[4],
+            "force_redeem_date": row[5],
+            "force_redeem_status": row[6],
+            "conv_price": safe_float(row[7], 0.0),
+            "conversion_premium": safe_float(row[8], 0.0),
+            "ytm": safe_float(row[9], 0.0),
+            "remaining_size": safe_float(row[10], 0.0),
+            "rating": row[11],
+        }
+    return result
+
+
+def is_stock_code(code: str) -> bool:
+    code = str(code)
+    return code.endswith((".SH", ".SZ")) and len(code) >= 9
 
 
 def upsert_bars(conn: sqlite3.Connection, code: str, df: pd.DataFrame) -> int:
@@ -338,7 +570,7 @@ def ensure_history_sqlite(xtdata: Any, conn: sqlite3.Connection, codes: list[str
     print(f"sqlite_sync_done requested={requested} skipped={skipped} db={DB_FILE}", flush=True)
 
 
-def load_data_from_sqlite(conn: sqlite3.Connection, codes: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
+def load_data_from_sqlite(conn: sqlite3.Connection, codes: list[str], start: str, end: str, metadata: dict[str, dict[str, Any]] | None = None) -> dict[str, pd.DataFrame]:
     data = {}
     for code in codes:
         df = pd.read_sql_query(
@@ -357,6 +589,8 @@ def load_data_from_sqlite(conn: sqlite3.Connection, codes: list[str], start: str
         df = df.drop(columns=["date"])
         df = df[df["close"].map(safe_float) > 0]
         if not df.empty:
+            if metadata and code in metadata:
+                df.attrs["meta"] = metadata[code]
             data[code] = df
     return data
 
@@ -383,6 +617,22 @@ def close_on(data: dict[str, pd.DataFrame], code: str, date: pd.Timestamp) -> fl
     return safe_float(bar["close"], 0.0) if bar is not None else 0.0
 
 
+def stock_stats(stock_data: dict[str, pd.DataFrame] | None, stock_code: str, date: pd.Timestamp, lookback: int) -> tuple[float, float]:
+    if not stock_data or not stock_code:
+        return 0.0, 0.0
+    df = stock_data.get(stock_code)
+    if df is None or df.empty:
+        return 0.0, 0.0
+    hist = df.loc[df.index <= date].tail(lookback + 1)
+    if len(hist) < 2:
+        return 0.0, 0.0
+    first_close = safe_float(hist["close"].iloc[0], 0.0)
+    last_close = safe_float(hist["close"].iloc[-1], 0.0)
+    momentum = last_close / first_close - 1.0 if first_close > 0 else 0.0
+    volatility = safe_float(hist["close"].pct_change(fill_method=None).std(), 0.0)
+    return momentum, volatility
+
+
 def zscore(value: float, values: list[float]) -> float:
     if not values:
         return 0.0
@@ -401,7 +651,7 @@ def strategy_weights(strategy: str) -> dict[str, float]:
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: int, strategy: str) -> list[tuple[str, float]]:
+def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: int, strategy: str, stock_data: dict[str, pd.DataFrame] | None = None) -> list[tuple[str, float]]:
     features = []
     for code, df in data.items():
         hist = df.loc[df.index <= date].tail(lookback + 1)
@@ -412,18 +662,55 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
         if first_close <= 0 or last_close <= 0:
             continue
         returns = hist["close"].pct_change(fill_method=None)
+        recent_returns = returns.dropna()
         momentum = last_close / first_close - 1.0
         short_momentum = last_close / safe_float(hist["close"].tail(6).iloc[0], last_close) - 1.0
         liquidity = safe_float(hist["amount"].tail(5).mean(), 0.0)
+        lookback_liquidity = safe_float(hist["amount"].mean(), 0.0)
+        recent_volume = safe_float(hist["volume"].tail(5).mean(), 0.0)
+        lookback_volume = safe_float(hist["volume"].mean(), 0.0)
         liquidity_std = safe_float(hist["amount"].tail(min(lookback, 20)).std(), 0.0)
         volatility = safe_float(returns.std(), 0.0)
+        downside_returns = recent_returns[recent_returns < 0]
+        downside_volatility = safe_float(downside_returns.std(), 0.0) if len(downside_returns) > 1 else 0.0
+        worst_return = safe_float(recent_returns.min(), 0.0) if len(recent_returns) else 0.0
+        up_day_consistency = safe_float((recent_returns > 0).mean(), 0.0) if len(recent_returns) else 0.0
         recent_high = safe_float(hist["close"].max(), last_close)
+        recent_low = safe_float(hist["close"].min(), last_close)
         recent_drawdown = last_close / recent_high - 1.0 if recent_high > 0 else 0.0
+        price_position = (last_close - recent_low) / (recent_high - recent_low) if recent_high > recent_low else 0.5
         ma_window = min(20, len(hist))
         moving_average = safe_float(hist["close"].tail(ma_window).mean(), last_close)
         trend_strength = last_close / moving_average - 1.0 if moving_average > 0 else 0.0
         amplitude = safe_float(((hist["high"] - hist["low"]) / hist["close"]).tail(min(lookback, 20)).mean(), 0.0)
+        gaps = (hist["open"] / hist["close"].shift(1) - 1.0).abs().dropna()
+        gap_risk = safe_float(gaps.tail(min(lookback, 20)).mean(), 0.0)
+        liquidity_trend = liquidity / lookback_liquidity - 1.0 if lookback_liquidity > 0 else 0.0
+        volume_trend = recent_volume / lookback_volume - 1.0 if lookback_volume > 0 else 0.0
         price_band_distance = 0.0 if 100.0 <= last_close <= 130.0 else min(abs(last_close - 100.0), abs(last_close - 130.0)) / 100.0
+        meta = df.attrs.get("meta", {})
+        trade_date = date.strftime("%Y%m%d")
+        list_date = safe_text(meta.get("list_date"))
+        maturity_date = safe_text(meta.get("maturity_date"))
+        force_redeem_date = safe_text(meta.get("force_redeem_date"))
+        listed_days = days_between(list_date, trade_date) if list_date else 0
+        remaining_years = days_between(trade_date, maturity_date) / 365.0 if maturity_date else 0.0
+        force_days = days_between(trade_date, force_redeem_date) if force_redeem_date else 999999
+        redeem_status = safe_text(meta.get("force_redeem_status"))
+        force_redeem_safety = 0.0
+        if 0 <= force_days <= 30:
+            force_redeem_safety = -1.0
+        elif any(word in redeem_status for word in ["强赎", "赎回", "最后", "公告", "满足"]):
+            force_redeem_safety = -0.7
+        conv_price = safe_float(meta.get("conv_price"), 0.0)
+        stock_code = safe_text(meta.get("stock_code"))
+        stock_momentum, stock_volatility = stock_stats(stock_data, stock_code, date, lookback)
+        stock_price = close_on(stock_data or {}, stock_code, date) if stock_code else 0.0
+        conversion_value = 100.0 / conv_price * stock_price if conv_price > 0 and stock_price > 0 else 0.0
+        conversion_premium = safe_float(meta.get("conversion_premium"), 0.0)
+        if conversion_premium == 0.0 and conversion_value > 0:
+            conversion_premium = last_close / conversion_value - 1.0
+        double_low = last_close + conversion_premium * 100.0 if conversion_premium != 0 else last_close
         features.append({
             "code": code,
             "momentum": momentum,
@@ -436,6 +723,24 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
             "drawdown_control": recent_drawdown,
             "trend_filter": trend_strength,
             "amplitude": amplitude,
+            "up_day_consistency": up_day_consistency,
+            "downside_volatility": downside_volatility,
+            "worst_return": worst_return,
+            "liquidity_trend": liquidity_trend,
+            "volume_trend": volume_trend,
+            "price_position": price_position,
+            "gap_risk": gap_risk,
+            "conversion_premium": conversion_premium,
+            "double_low": double_low,
+            "conversion_value": conversion_value,
+            "ytm": safe_float(meta.get("ytm"), 0.0),
+            "remaining_years": remaining_years,
+            "remaining_size": safe_float(meta.get("remaining_size"), 0.0),
+            "listed_days": listed_days,
+            "force_redeem_safety": force_redeem_safety,
+            "rating_score": rating_to_score(safe_text(meta.get("rating"))),
+            "stock_momentum": stock_momentum,
+            "stock_volatility": stock_volatility,
         })
 
     if not features:
@@ -451,6 +756,24 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
     drawdown_values = [item["drawdown_control"] for item in features]
     trend_values = [item["trend_filter"] for item in features]
     amplitude_values = [item["amplitude"] for item in features]
+    up_day_consistency_values = [item["up_day_consistency"] for item in features]
+    downside_volatility_values = [item["downside_volatility"] for item in features]
+    worst_return_values = [item["worst_return"] for item in features]
+    liquidity_trend_values = [item["liquidity_trend"] for item in features]
+    volume_trend_values = [item["volume_trend"] for item in features]
+    price_position_values = [item["price_position"] for item in features]
+    gap_risk_values = [item["gap_risk"] for item in features]
+    conversion_premium_values = [item["conversion_premium"] for item in features]
+    double_low_values = [item["double_low"] for item in features]
+    conversion_value_values = [item["conversion_value"] for item in features]
+    ytm_values = [item["ytm"] for item in features]
+    remaining_years_values = [item["remaining_years"] for item in features]
+    remaining_size_values = [math.log1p(max(item["remaining_size"], 0.0)) for item in features]
+    listed_days_values = [min(item["listed_days"], 365.0) for item in features]
+    force_redeem_safety_values = [item["force_redeem_safety"] for item in features]
+    rating_score_values = [item["rating_score"] for item in features]
+    stock_momentum_values = [item["stock_momentum"] for item in features]
+    stock_volatility_values = [item["stock_volatility"] for item in features]
 
     scored = []
     for item in features:
@@ -464,6 +787,24 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
         drawdown_control_z = zscore(item["drawdown_control"], drawdown_values)
         trend_filter_z = zscore(item["trend_filter"], trend_values)
         low_amplitude_z = -zscore(item["amplitude"], amplitude_values)
+        up_day_consistency_z = zscore(item["up_day_consistency"], up_day_consistency_values)
+        low_downside_volatility_z = -zscore(item["downside_volatility"], downside_volatility_values)
+        tail_loss_control_z = zscore(item["worst_return"], worst_return_values)
+        liquidity_trend_z = zscore(item["liquidity_trend"], liquidity_trend_values)
+        volume_trend_z = zscore(item["volume_trend"], volume_trend_values)
+        price_position_z = zscore(item["price_position"], price_position_values)
+        low_gap_risk_z = -zscore(item["gap_risk"], gap_risk_values)
+        conversion_premium_z = -zscore(item["conversion_premium"], conversion_premium_values)
+        double_low_z = -zscore(item["double_low"], double_low_values)
+        conversion_value_z = zscore(item["conversion_value"], conversion_value_values)
+        ytm_z = zscore(item["ytm"], ytm_values)
+        remaining_years_z = zscore(item["remaining_years"], remaining_years_values)
+        remaining_size_z = zscore(math.log1p(max(item["remaining_size"], 0.0)), remaining_size_values)
+        listed_days_z = zscore(min(item["listed_days"], 365.0), listed_days_values)
+        force_redeem_safety_z = zscore(item["force_redeem_safety"], force_redeem_safety_values)
+        rating_score_z = zscore(item["rating_score"], rating_score_values)
+        stock_momentum_z = zscore(item["stock_momentum"], stock_momentum_values)
+        stock_volatility_z = -zscore(item["stock_volatility"], stock_volatility_values)
 
         factor_values = {
             "momentum": momentum_z,
@@ -476,6 +817,24 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
             "drawdown_control": drawdown_control_z,
             "trend_filter": trend_filter_z,
             "low_amplitude": low_amplitude_z,
+            "up_day_consistency": up_day_consistency_z,
+            "low_downside_volatility": low_downside_volatility_z,
+            "tail_loss_control": tail_loss_control_z,
+            "liquidity_trend": liquidity_trend_z,
+            "volume_trend": volume_trend_z,
+            "price_position": price_position_z,
+            "low_gap_risk": low_gap_risk_z,
+            "conversion_premium": conversion_premium_z,
+            "double_low": double_low_z,
+            "conversion_value": conversion_value_z,
+            "ytm": ytm_z,
+            "remaining_years": remaining_years_z,
+            "remaining_size": remaining_size_z,
+            "listed_days": listed_days_z,
+            "force_redeem_safety": force_redeem_safety_z,
+            "rating_score": rating_score_z,
+            "stock_momentum": stock_momentum_z,
+            "stock_volatility": stock_volatility_z,
         }
         score = sum(weight * factor_values[factor] for factor, weight in strategy_weights(strategy).items())
 
@@ -617,7 +976,7 @@ def best_by_strategy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [best[name] for name in sorted(best)]
 
 
-def run_backtest(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+def run_backtest(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     dates = trading_dates(data)
     if len(dates) <= args.lookback:
         raise RuntimeError("Not enough historical bars for the requested lookback.")
@@ -645,7 +1004,7 @@ def run_backtest(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tup
             continue
         rebalance_index += 1
 
-        selected = [code for code, _ in score_universe(data, date, args.lookback, args.strategy)[: args.top]]
+        selected = [code for code, _ in score_universe(data, date, args.lookback, args.strategy, stock_data)[: args.top]]
         selected_set = set(selected)
 
         for code in list(positions):
@@ -787,10 +1146,10 @@ def strategy_trials() -> list[tuple[str, int, int, int]]:
     ]
 
 
-def result_for_trial(args: argparse.Namespace, data: dict[str, pd.DataFrame], run_id: str, trial: tuple[str, int, int, int]) -> tuple[dict[str, Any], argparse.Namespace]:
+def result_for_trial(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None, run_id: str, trial: tuple[str, int, int, int]) -> tuple[dict[str, Any], argparse.Namespace]:
     strategy, top, lookback, rebalance_day = trial
     trial_args = clone_args(args, strategy, top, lookback, rebalance_day)
-    _trades, _equity, summary = run_backtest(trial_args, data)
+    _trades, _equity, summary = run_backtest(trial_args, data, stock_data)
     passed = (
         abs(safe_float(summary["max_drawdown"], 0.0)) <= args.max_drawdown
         and safe_float(summary["annual_return"], 0.0) >= 0.08
@@ -811,20 +1170,21 @@ def result_for_trial(args: argparse.Namespace, data: dict[str, pd.DataFrame], ru
     return row, trial_args
 
 
-def init_worker(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> None:
-    global WORKER_ARGS, WORKER_DATA
+def init_worker(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame]) -> None:
+    global WORKER_ARGS, WORKER_DATA, WORKER_STOCK_DATA
     WORKER_ARGS = args
     WORKER_DATA = data
+    WORKER_STOCK_DATA = stock_data
 
 
 def worker_trial(payload: tuple[str, tuple[str, int, int, int]]) -> tuple[dict[str, Any], argparse.Namespace]:
     run_id, trial = payload
     if WORKER_ARGS is None or WORKER_DATA is None:
         raise RuntimeError("Worker was not initialized.")
-    return result_for_trial(WORKER_ARGS, WORKER_DATA, run_id, trial)
+    return result_for_trial(WORKER_ARGS, WORKER_DATA, WORKER_STOCK_DATA, run_id, trial)
 
 
-def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     trials = strategy_trials()
     rows = []
     best: dict[str, Any] | None = None
@@ -846,7 +1206,7 @@ def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tuple[l
     workers = max(1, int(args.workers or 1))
     print(f"optimize_workers={workers} trials={total}", flush=True)
     if workers == 1:
-        iterator = (result_for_trial(args, data, run_id, trial) for trial in trials)
+        iterator = (result_for_trial(args, data, stock_data, run_id, trial) for trial in trials)
         for row, trial_args in iterator:
             done += 1
             rows.append(row)
@@ -859,7 +1219,7 @@ def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tuple[l
                 best = {**row, "_args": trial_args}
     else:
         payloads = [(run_id, trial) for trial in trials]
-        with ProcessPoolExecutor(max_workers=workers, initializer=init_worker, initargs=(args, data)) as executor:
+        with ProcessPoolExecutor(max_workers=workers, initializer=init_worker, initargs=(args, data, stock_data or {})) as executor:
             futures = [executor.submit(worker_trial, payload) for payload in payloads]
             for future in as_completed(futures):
                 row, trial_args = future.result()
@@ -905,16 +1265,24 @@ def main() -> int:
     sync_started_at = time.perf_counter()
     conn = init_db()
     ensure_history_sqlite(xtdata, conn, codes, args.start, args.end)
+    sync_cb_metadata(xtdata, conn, codes)
+    metadata = load_metadata(conn, codes)
+    stock_codes = sorted({meta.get("stock_code", "") for meta in metadata.values() if is_stock_code(meta.get("stock_code", ""))})
+    if stock_codes:
+        print(f"underlying_stock_count={len(stock_codes)}", flush=True)
+        ensure_history_sqlite(xtdata, conn, stock_codes, args.start, args.end)
     print(f"sync_elapsed_seconds={time.perf_counter() - sync_started_at:.2f}", flush=True)
 
     load_started_at = time.perf_counter()
-    data = load_data_from_sqlite(conn, codes, args.start, args.end)
+    data = load_data_from_sqlite(conn, codes, args.start, args.end, metadata)
+    stock_data = load_data_from_sqlite(conn, stock_codes, args.start, args.end) if stock_codes else {}
     print(f"loaded_bonds={len(data)}", flush=True)
+    print(f"loaded_underlying_stocks={len(stock_data)}", flush=True)
     print(f"load_elapsed_seconds={time.perf_counter() - load_started_at:.2f}", flush=True)
 
     if args.optimize:
         started_at = time.perf_counter()
-        rows, best = optimize(args, data)
+        rows, best = optimize(args, data, stock_data)
         fields = optimize_fields()
         write_csv(OPTIMIZE_FILE, rows, fields)
         write_csv(BEST_BY_STRATEGY_FILE, best_by_strategy(rows), fields)
@@ -933,7 +1301,7 @@ def main() -> int:
             print(f"  {key}: {best[key]}", flush=True)
         args = best["_args"]
 
-    trades, equity, summary = run_backtest(args, data)
+    trades, equity, summary = run_backtest(args, data, stock_data)
     monthly = period_returns(equity, 6)
     yearly = period_returns(equity, 4)
     write_csv(TRADES_FILE, trades, ["date", "side", "code", "price", "volume", "amount", "fee", "reason"])
