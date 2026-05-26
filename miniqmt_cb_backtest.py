@@ -30,6 +30,7 @@ TARGET_FILE = r"E:\WorkSpace\ai\QMT\target_strategy_metrics.csv"
 TARGET_APPLIED_FILE = os.path.join(OUTPUT_DIR, "cb_target_constraints_applied.csv")
 MONTHLY_FILE = os.path.join(OUTPUT_DIR, "cb_backtest_monthly_returns.csv")
 YEARLY_FILE = os.path.join(OUTPUT_DIR, "cb_backtest_yearly_returns.csv")
+RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
 
 WORKER_DATA: dict[str, pd.DataFrame] | None = None
 WORKER_ARGS: argparse.Namespace | None = None
@@ -45,6 +46,54 @@ STRATEGY_DEFINITIONS = {
 }
 
 
+FACTOR_DESCRIPTIONS = {
+    "momentum": "N-day convertible-bond price momentum; higher is stronger trend.",
+    "short_reversal": "Negative 5-day momentum; higher favors short-term pullback.",
+    "liquidity": "Recent log turnover amount; higher favors easier trading.",
+    "low_volatility": "Negative return volatility; higher favors smoother bonds.",
+    "low_price": "Negative convertible-bond close price; higher favors cheaper bonds.",
+}
+
+
+GENERATED_STRATEGIES = [
+    {
+        "name": "low_price_core",
+        "weights": {"low_price": 0.55, "low_volatility": 0.25, "liquidity": 0.20},
+        "description": "Low-price defensive core with liquidity support.",
+    },
+    {
+        "name": "low_price_liquid",
+        "weights": {"low_price": 0.45, "liquidity": 0.35, "low_volatility": 0.20},
+        "description": "Low-price bonds that are easier to trade.",
+    },
+    {
+        "name": "low_price_momentum",
+        "weights": {"low_price": 0.45, "momentum": 0.25, "liquidity": 0.20, "low_volatility": 0.10},
+        "description": "Cheap bonds with moderate trend confirmation.",
+    },
+    {
+        "name": "low_vol_core",
+        "weights": {"low_volatility": 0.55, "liquidity": 0.25, "low_price": 0.20},
+        "description": "Low-volatility defensive rotation.",
+    },
+    {
+        "name": "balanced_defensive",
+        "weights": {"low_price": 0.30, "low_volatility": 0.30, "liquidity": 0.25, "momentum": 0.15},
+        "description": "Balanced low price, low volatility, liquidity, and trend.",
+    },
+    {
+        "name": "liquid_low_vol",
+        "weights": {"liquidity": 0.45, "low_volatility": 0.35, "low_price": 0.20},
+        "description": "Liquid names with volatility control.",
+    },
+    {
+        "name": "reversal_defensive",
+        "weights": {"short_reversal": 0.35, "low_volatility": 0.30, "low_price": 0.20, "liquidity": 0.15},
+        "description": "Defensive short-term reversal.",
+    },
+]
+
+
 @dataclass
 class Position:
     volume: int
@@ -56,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", default=three_years_ago())
     parser.add_argument("--end", default=datetime.now().strftime("%Y%m%d"))
     parser.add_argument("--limit", type=int, default=0, help="Convertible-bond universe size. 0 means full universe.")
-    parser.add_argument("--strategy", default="balanced", choices=["momentum", "reversal", "low_vol", "low_price", "liquidity", "balanced"])
+    parser.add_argument("--strategy", default="balanced_defensive", choices=[item["name"] for item in GENERATED_STRATEGIES])
     parser.add_argument("--top", type=int, default=5, help="Target holding count.")
     parser.add_argument("--lookback", type=int, default=40, help="Signal lookback bars.")
     parser.add_argument("--rebalance-days", type=int, default=10, help="Rebalance every N trading days.")
@@ -325,6 +374,13 @@ def zscore(value: float, values: list[float]) -> float:
     return (value - avg) / std
 
 
+def strategy_weights(strategy: str) -> dict[str, float]:
+    for item in GENERATED_STRATEGIES:
+        if item["name"] == strategy:
+            return item["weights"]
+    raise ValueError(f"Unknown strategy: {strategy}")
+
+
 def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: int, strategy: str) -> list[tuple[str, float]]:
     features = []
     for code, df in data.items():
@@ -366,18 +422,14 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
         low_vol_z = -zscore(item["volatility"], volatility_values)
         low_price_z = -zscore(item["close"], close_values)
 
-        if strategy == "momentum":
-            score = momentum_z + 0.25 * liquidity_z - 0.35 * zscore(item["volatility"], volatility_values)
-        elif strategy == "reversal":
-            score = short_reversal_z + 0.2 * low_vol_z + 0.2 * liquidity_z
-        elif strategy == "low_vol":
-            score = low_vol_z + 0.25 * liquidity_z + 0.1 * momentum_z
-        elif strategy == "low_price":
-            score = low_price_z + 0.25 * low_vol_z + 0.15 * liquidity_z
-        elif strategy == "liquidity":
-            score = liquidity_z + 0.2 * momentum_z - 0.2 * zscore(item["volatility"], volatility_values)
-        else:
-            score = 0.35 * momentum_z + 0.25 * low_vol_z + 0.2 * liquidity_z + 0.2 * low_price_z
+        factor_values = {
+            "momentum": momentum_z,
+            "short_reversal": short_reversal_z,
+            "liquidity": liquidity_z,
+            "low_volatility": low_vol_z,
+            "low_price": low_price_z,
+        }
+        score = sum(weight * factor_values[factor] for factor, weight in strategy_weights(strategy).items())
 
         scored.append((item["code"], score))
     scored.sort(key=lambda item: item[1], reverse=True)
@@ -401,6 +453,14 @@ def write_csv(path: str, rows: list[dict[str, Any]], fields: list[str]) -> None:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def copy_csv(src: str, dst: str) -> None:
+    if not os.path.exists(src):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        fdst.write(fsrc.read())
 
 
 def period_returns(equity: list[dict[str, Any]], period_len: int) -> list[dict[str, Any]]:
@@ -468,8 +528,19 @@ def advanced_metrics(equity: list[dict[str, Any]], initial_cash: float) -> dict[
 
 
 def write_strategy_definitions() -> None:
-    rows = [{"strategy": name, "definition": definition} for name, definition in STRATEGY_DEFINITIONS.items()]
-    write_csv(STRATEGY_FILE, rows, ["strategy", "definition"])
+    rows = []
+    for item in GENERATED_STRATEGIES:
+        rows.append({
+            "strategy": item["name"],
+            "definition": " + ".join(f"{weight:.2f}*{factor}" for factor, weight in item["weights"].items()),
+            "description": item["description"],
+        })
+    write_csv(STRATEGY_FILE, rows, ["strategy", "definition", "description"])
+
+
+def write_factor_definitions(path: str) -> None:
+    rows = [{"factor": factor, "description": description} for factor, description in FACTOR_DESCRIPTIONS.items()]
+    write_csv(path, rows, ["factor", "description"])
 
 
 def write_target_constraints() -> None:
@@ -655,7 +726,7 @@ def optimize_fields() -> list[str]:
 
 
 def strategy_trials() -> list[tuple[str, int, int, int]]:
-    strategies = ["balanced", "low_vol", "low_price", "liquidity"]
+    strategies = [item["name"] for item in GENERATED_STRATEGIES]
     tops = [3, 5, 8]
     lookbacks = [40, 60, 90]
     rebalance_days = [10, 20, 40]
@@ -710,8 +781,16 @@ def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tuple[l
     rows = []
     best: dict[str, Any] | None = None
     run_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    setattr(args, "run_id", run_id)
+    setattr(args, "run_dir", run_dir)
     fields = optimize_fields()
     write_csv(OPTIMIZE_FILE, rows, fields)
+    write_csv(os.path.join(run_dir, "cb_strategy_search.csv"), rows, fields)
+    copy_csv(STRATEGY_FILE, os.path.join(run_dir, "cb_strategy_definitions.csv"))
+    copy_csv(TARGET_APPLIED_FILE, os.path.join(run_dir, "cb_target_constraints_applied.csv"))
+    write_factor_definitions(os.path.join(run_dir, "cb_factor_definitions.csv"))
 
     total = len(trials)
     done = 0
@@ -725,6 +804,7 @@ def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tuple[l
             rows.append(row)
             if done == 1 or done % 20 == 0 or done == total:
                 write_csv(OPTIMIZE_FILE, rows, fields)
+                write_csv(os.path.join(run_dir, "cb_strategy_search.csv"), rows, fields)
             if done % 20 == 0 or done == total:
                 print(f"optimize_progress={done}/{total}", flush=True)
             if row["passed"] and (best is None or row["rank_score"] > best["rank_score"]):
@@ -739,6 +819,7 @@ def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame]) -> tuple[l
                 rows.append(row)
                 if done == 1 or done % 20 == 0 or done == total:
                     write_csv(OPTIMIZE_FILE, rows, fields)
+                    write_csv(os.path.join(run_dir, "cb_strategy_search.csv"), rows, fields)
                 if done % 20 == 0 or done == total:
                     print(f"optimize_progress={done}/{total}", flush=True)
                 if row["passed"] and (best is None or row["rank_score"] > best["rank_score"]):
@@ -789,6 +870,10 @@ def main() -> int:
         fields = optimize_fields()
         write_csv(OPTIMIZE_FILE, rows, fields)
         write_csv(BEST_BY_STRATEGY_FILE, best_by_strategy(rows), fields)
+        run_dir = getattr(args, "run_dir", "")
+        if run_dir:
+            write_csv(os.path.join(run_dir, "cb_strategy_search.csv"), rows, fields)
+            write_csv(os.path.join(run_dir, "cb_strategy_best_by_type.csv"), best_by_strategy(rows), fields)
         print(f"wrote {OPTIMIZE_FILE}")
         print(f"wrote {BEST_BY_STRATEGY_FILE}")
         print(f"optimize_elapsed_seconds={time.perf_counter() - started_at:.2f}", flush=True)
@@ -808,6 +893,14 @@ def main() -> int:
     write_csv(SUMMARY_FILE, [summary], list(summary.keys()))
     write_csv(MONTHLY_FILE, monthly, ["period", "return"])
     write_csv(YEARLY_FILE, yearly, ["period", "return"])
+    run_dir = getattr(args, "run_dir", "")
+    if run_dir:
+        write_csv(os.path.join(run_dir, "cb_backtest_trades.csv"), trades, ["date", "side", "code", "price", "volume", "amount", "fee", "reason"])
+        write_csv(os.path.join(run_dir, "cb_backtest_equity.csv"), equity, ["date", "cash", "position_value", "total_value", "holding_count"])
+        write_csv(os.path.join(run_dir, "cb_backtest_summary.csv"), [summary], list(summary.keys()))
+        write_csv(os.path.join(run_dir, "cb_backtest_monthly_returns.csv"), monthly, ["period", "return"])
+        write_csv(os.path.join(run_dir, "cb_backtest_yearly_returns.csv"), yearly, ["period", "return"])
+        print(f"wrote run archive {run_dir}")
 
     print("Backtest summary")
     for key, value in summary.items():

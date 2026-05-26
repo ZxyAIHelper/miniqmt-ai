@@ -42,6 +42,9 @@ The script:
   loss, and drawdown duration metrics.
   Optimization is CPU-parallel after MiniQMT data has been synced into SQLite;
   worker processes do not call MiniQMT.
+  Each optimize run is archived under `qmt_outputs/runs/<run_id>/`, including
+  strategy definitions, factor definitions, target constraints, and search
+  results. This keeps every search round available for later Codex analysis.
 
 No real order is sent. This is only a backtest and signal-flow validation.
 
