@@ -16,6 +16,10 @@ the target constraints in `target_strategy_metrics.csv`:
 python miniqmt_cb_backtest.py --optimize
 ```
 
+Strategies are loaded from `strategy_candidates.json` by default. This file is
+the editable strategy pool for human or AI iteration; the Python code should
+execute and validate candidates, not hard-code each experiment.
+
 Use parallel CPU workers for optimization:
 
 ```powershell
@@ -43,8 +47,9 @@ The script:
   Optimization is CPU-parallel after MiniQMT data has been synced into SQLite;
   worker processes do not call MiniQMT.
   Each optimize run is archived under `qmt_outputs/runs/<run_id>/`, including
-  strategy definitions, factor definitions, target constraints, and search
-  results. This keeps every search round available for later Codex analysis.
+  the source strategy candidate JSON, strategy definitions, factor definitions,
+  target constraints, and search results. This keeps every search round
+  available for later Codex analysis.
 
 No real order is sent. This is only a backtest and signal-flow validation.
 
