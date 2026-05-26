@@ -50,46 +50,66 @@ FACTOR_DESCRIPTIONS = {
     "momentum": "N-day convertible-bond price momentum; higher is stronger trend.",
     "short_reversal": "Negative 5-day momentum; higher favors short-term pullback.",
     "liquidity": "Recent log turnover amount; higher favors easier trading.",
+    "liquidity_stability": "Negative recent amount variability; higher favors more stable liquidity.",
     "low_volatility": "Negative return volatility; higher favors smoother bonds.",
     "low_price": "Negative convertible-bond close price; higher favors cheaper bonds.",
+    "price_band": "Closeness to the preferred 100-130 price band.",
+    "drawdown_control": "Negative recent peak-to-current drawdown; higher avoids names falling far from recent highs.",
+    "trend_filter": "Close price above moving average; higher favors healthier trend.",
+    "low_amplitude": "Negative high-low amplitude; higher avoids jumpy bonds.",
 }
 
 
 GENERATED_STRATEGIES = [
     {
         "name": "low_price_core",
-        "weights": {"low_price": 0.55, "low_volatility": 0.25, "liquidity": 0.20},
+        "weights": {"low_price": 0.35, "price_band": 0.25, "low_volatility": 0.20, "liquidity": 0.20},
         "description": "Low-price defensive core with liquidity support.",
     },
     {
         "name": "low_price_liquid",
-        "weights": {"low_price": 0.45, "liquidity": 0.35, "low_volatility": 0.20},
+        "weights": {"low_price": 0.30, "price_band": 0.20, "liquidity": 0.30, "low_volatility": 0.20},
         "description": "Low-price bonds that are easier to trade.",
     },
     {
         "name": "low_price_momentum",
-        "weights": {"low_price": 0.45, "momentum": 0.25, "liquidity": 0.20, "low_volatility": 0.10},
+        "weights": {"price_band": 0.25, "low_price": 0.25, "momentum": 0.20, "trend_filter": 0.15, "liquidity": 0.15},
         "description": "Cheap bonds with moderate trend confirmation.",
     },
     {
         "name": "low_vol_core",
-        "weights": {"low_volatility": 0.55, "liquidity": 0.25, "low_price": 0.20},
+        "weights": {"low_volatility": 0.40, "low_amplitude": 0.25, "liquidity": 0.20, "price_band": 0.15},
         "description": "Low-volatility defensive rotation.",
     },
     {
         "name": "balanced_defensive",
-        "weights": {"low_price": 0.30, "low_volatility": 0.30, "liquidity": 0.25, "momentum": 0.15},
+        "weights": {"price_band": 0.25, "low_volatility": 0.20, "liquidity": 0.20, "drawdown_control": 0.20, "momentum": 0.15},
         "description": "Balanced low price, low volatility, liquidity, and trend.",
     },
     {
         "name": "liquid_low_vol",
-        "weights": {"liquidity": 0.45, "low_volatility": 0.35, "low_price": 0.20},
+        "weights": {"liquidity": 0.30, "liquidity_stability": 0.20, "low_volatility": 0.30, "price_band": 0.20},
         "description": "Liquid names with volatility control.",
     },
     {
         "name": "reversal_defensive",
-        "weights": {"short_reversal": 0.35, "low_volatility": 0.30, "low_price": 0.20, "liquidity": 0.15},
+        "weights": {"short_reversal": 0.25, "drawdown_control": 0.25, "low_volatility": 0.20, "price_band": 0.20, "liquidity": 0.10},
         "description": "Defensive short-term reversal.",
+    },
+    {
+        "name": "drawdown_guard",
+        "weights": {"drawdown_control": 0.35, "low_volatility": 0.25, "price_band": 0.20, "liquidity": 0.20},
+        "description": "Avoids bonds in deeper recent drawdown while keeping price and liquidity discipline.",
+    },
+    {
+        "name": "stable_liquidity",
+        "weights": {"liquidity_stability": 0.30, "liquidity": 0.25, "low_amplitude": 0.25, "price_band": 0.20},
+        "description": "Focuses on stable active bonds with controlled intraday amplitude.",
+    },
+    {
+        "name": "trend_band",
+        "weights": {"trend_filter": 0.30, "price_band": 0.25, "momentum": 0.20, "low_volatility": 0.15, "liquidity": 0.10},
+        "description": "Preferred price band plus trend confirmation.",
     },
 ]
 
@@ -395,14 +415,27 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
         momentum = last_close / first_close - 1.0
         short_momentum = last_close / safe_float(hist["close"].tail(6).iloc[0], last_close) - 1.0
         liquidity = safe_float(hist["amount"].tail(5).mean(), 0.0)
+        liquidity_std = safe_float(hist["amount"].tail(min(lookback, 20)).std(), 0.0)
         volatility = safe_float(returns.std(), 0.0)
+        recent_high = safe_float(hist["close"].max(), last_close)
+        recent_drawdown = last_close / recent_high - 1.0 if recent_high > 0 else 0.0
+        ma_window = min(20, len(hist))
+        moving_average = safe_float(hist["close"].tail(ma_window).mean(), last_close)
+        trend_strength = last_close / moving_average - 1.0 if moving_average > 0 else 0.0
+        amplitude = safe_float(((hist["high"] - hist["low"]) / hist["close"]).tail(min(lookback, 20)).mean(), 0.0)
+        price_band_distance = 0.0 if 100.0 <= last_close <= 130.0 else min(abs(last_close - 100.0), abs(last_close - 130.0)) / 100.0
         features.append({
             "code": code,
             "momentum": momentum,
             "short_momentum": short_momentum,
             "liquidity": liquidity,
+            "liquidity_stability": -liquidity_std / (liquidity + 1.0),
             "volatility": volatility,
             "close": last_close,
+            "price_band": -price_band_distance,
+            "drawdown_control": recent_drawdown,
+            "trend_filter": trend_strength,
+            "amplitude": amplitude,
         })
 
     if not features:
@@ -410,24 +443,39 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
 
     momentum_values = [item["momentum"] for item in features]
     liquidity_values = [math.log1p(item["liquidity"]) for item in features]
+    liquidity_stability_values = [item["liquidity_stability"] for item in features]
     volatility_values = [item["volatility"] for item in features]
     close_values = [item["close"] for item in features]
     short_momentum_values = [item["short_momentum"] for item in features]
+    price_band_values = [item["price_band"] for item in features]
+    drawdown_values = [item["drawdown_control"] for item in features]
+    trend_values = [item["trend_filter"] for item in features]
+    amplitude_values = [item["amplitude"] for item in features]
 
     scored = []
     for item in features:
         momentum_z = zscore(item["momentum"], momentum_values)
         short_reversal_z = -zscore(item["short_momentum"], short_momentum_values)
         liquidity_z = zscore(math.log1p(item["liquidity"]), liquidity_values)
+        liquidity_stability_z = zscore(item["liquidity_stability"], liquidity_stability_values)
         low_vol_z = -zscore(item["volatility"], volatility_values)
         low_price_z = -zscore(item["close"], close_values)
+        price_band_z = zscore(item["price_band"], price_band_values)
+        drawdown_control_z = zscore(item["drawdown_control"], drawdown_values)
+        trend_filter_z = zscore(item["trend_filter"], trend_values)
+        low_amplitude_z = -zscore(item["amplitude"], amplitude_values)
 
         factor_values = {
             "momentum": momentum_z,
             "short_reversal": short_reversal_z,
             "liquidity": liquidity_z,
+            "liquidity_stability": liquidity_stability_z,
             "low_volatility": low_vol_z,
             "low_price": low_price_z,
+            "price_band": price_band_z,
+            "drawdown_control": drawdown_control_z,
+            "trend_filter": trend_filter_z,
+            "low_amplitude": low_amplitude_z,
         }
         score = sum(weight * factor_values[factor] for factor, weight in strategy_weights(strategy).items())
 
