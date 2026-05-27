@@ -16,11 +16,45 @@
     },
     "avoid": {
       "type": "object",
-      "description": "Factors or parameter regions the agent recommends avoiding based on historical results."
+      "additionalProperties": false,
+      "description": "Factors or parameter regions the agent recommends avoiding based on historical results.",
+      "properties": {
+        "factors": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "parameter_regions": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": ["factors", "parameter_regions", "reason"]
     },
     "focus": {
       "type": "object",
-      "description": "Factors, parameter regions, or hypotheses the agent recommends focusing on next."
+      "additionalProperties": false,
+      "description": "Factors, parameter regions, or hypotheses the agent recommends focusing on next.",
+      "properties": {
+        "factors": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "parameter_regions": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "hypotheses": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": ["factors", "parameter_regions", "hypotheses", "reason"]
     },
     "review_policy": {
       "type": "object",
