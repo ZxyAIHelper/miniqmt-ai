@@ -10,6 +10,41 @@
       "type": "string",
       "description": "Concise explanation for stopping or continuing."
     },
+    "diagnosis": {
+      "type": "string",
+      "description": "History-based quantitative diagnosis of what worked, failed, and why."
+    },
+    "avoid": {
+      "type": "object",
+      "description": "Factors or parameter regions the agent recommends avoiding based on historical results."
+    },
+    "focus": {
+      "type": "object",
+      "description": "Factors, parameter regions, or hypotheses the agent recommends focusing on next."
+    },
+    "review_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "When the agent wants to inspect the next round instead of waiting for every planned combination.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["full_round", "after_n_trials"]
+        },
+        "min_completed_trials": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "review_every_trials": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": ["mode", "min_completed_trials", "review_every_trials", "reason"]
+    },
     "strategies": {
       "type": "array",
       "description": "New strategy candidates to try next. Empty when stop is true.",
@@ -38,11 +73,34 @@
               },
               "required": ["factor", "weight"]
             }
+          },
+          "parameter_grid": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "top": {
+                "type": "array",
+                "items": {"type": "integer", "enum": [3, 5, 8]}
+              },
+              "lookback": {
+                "type": "array",
+                "items": {"type": "integer", "enum": [40, 60, 90]}
+              },
+              "rebalance_days": {
+                "type": "array",
+                "items": {"type": "integer", "enum": [10, 20, 40]}
+              }
+            },
+            "required": ["top", "lookback", "rebalance_days"]
+          },
+          "research_thesis": {
+            "type": "string",
+            "description": "Why this factor mix and parameter grid are worth testing."
           }
         },
-        "required": ["name", "description", "weights"]
+        "required": ["name", "description", "weights", "parameter_grid", "research_thesis"]
       }
     }
   },
-  "required": ["stop", "reason", "strategies"]
+  "required": ["stop", "reason", "diagnosis", "avoid", "focus", "review_policy", "strategies"]
 }

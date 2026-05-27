@@ -18,6 +18,7 @@ OUTPUT_DIR = BASE_DIR / "qmt_outputs"
 RUNS_DIR = OUTPUT_DIR / "runs"
 AI_DIR = OUTPUT_DIR / "ai_reviews"
 HISTORY_FILE = OUTPUT_DIR / "ai_strategy_iterations.jsonl"
+REVIEW_POLICY_FILE = OUTPUT_DIR / "ai_review_policy.json"
 DEFAULT_STRATEGY_FILE = BASE_DIR / "strategy_candidates.json"
 BACKTEST_SCRIPT = BASE_DIR / "miniqmt_cb_backtest.py"
 CODEX_DECISION_SCHEMA = BASE_DIR / "codex_strategy_decision.schema.json"
@@ -52,8 +53,12 @@ WEAK_OR_UNAVAILABLE_FACTORS = {
     "rating_score",
 }
 
+DEFAULT_TOP_VALUES = [3, 5, 8]
+DEFAULT_LOOKBACK_VALUES = [40, 60, 90]
+DEFAULT_REBALANCE_VALUES = [10, 20, 40]
 
-def parse_args() -> argparse.Namespace:
+
+def parse_args_from(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Iteratively run MiniQMT CB optimization and evolve strategy candidates.")
     parser.add_argument("--rounds", type=int, default=0, help="Manual round cap. 0 means keep running until the AI stop decision.")
     parser.add_argument("--safety-max-rounds", type=int, default=100, help="Emergency guard for --rounds 0 to avoid accidental endless execution.")
@@ -67,8 +72,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-command", default="codex", help="Codex CLI command.")
     parser.add_argument("--codex-model", default="", help="Optional model name passed to codex exec.")
     parser.add_argument("--codex-timeout", type=int, default=900, help="Seconds to wait for the Codex decision agent.")
+    parser.add_argument("--ignore-history", action="store_true", help="Do not include prior AI iteration history in the decision prompt.")
+    parser.add_argument("--review-policy-file", default=str(REVIEW_POLICY_FILE), help="JSON file where the AI stores when it wants to review partial backtest results.")
     parser.add_argument("--dry-run-ai", action="store_true", help="Analyze latest run and propose strategies without launching backtest.")
-    return parser.parse_args()
+    values = argv[1:] if argv is not None else None
+    return parser.parse_args(values)
+
+
+def parse_args() -> argparse.Namespace:
+    return parse_args_from()
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -131,6 +143,20 @@ def latest_run_dir() -> Path | None:
 
 def run_backtest_round(args: argparse.Namespace) -> tuple[int, Path | None]:
     before = latest_run_dir()
+    policy = load_review_policy(Path(args.review_policy_file))
+    stop_after_trials = review_policy_stop_after(policy)
+    command = backtest_command(args, stop_after_trials)
+    print("launch_round_command=" + " ".join(command), flush=True)
+    if stop_after_trials:
+        print(f"ai_review_checkpoint=after_trials={stop_after_trials} reason={policy.get('reason', '')}", flush=True)
+    completed = subprocess.run(command, cwd=str(BASE_DIR))
+    after = latest_run_dir()
+    if after is not None and after != before:
+        return completed.returncode, after
+    return completed.returncode, after
+
+
+def backtest_command(args: argparse.Namespace, stop_after_trials: int = 0) -> list[str]:
     command = [
         sys.executable,
         str(BACKTEST_SCRIPT),
@@ -142,12 +168,37 @@ def run_backtest_round(args: argparse.Namespace) -> tuple[int, Path | None]:
         "--limit",
         str(args.limit),
     ]
-    print("launch_round_command=" + " ".join(command), flush=True)
-    completed = subprocess.run(command, cwd=str(BASE_DIR))
-    after = latest_run_dir()
-    if after is not None and after != before:
-        return completed.returncode, after
-    return completed.returncode, after
+    if stop_after_trials > 0:
+        command.extend(["--stop-after-trials", str(stop_after_trials)])
+    return command
+
+
+def normalize_review_policy(policy: Any) -> dict[str, Any]:
+    if not isinstance(policy, dict):
+        policy = {}
+    mode = str(policy.get("mode", "full_round")).strip()
+    if mode not in {"full_round", "after_n_trials"}:
+        mode = "full_round"
+    min_completed = int(max(20, min(2000, safe_float(policy.get("min_completed_trials"), 0))))
+    every = int(max(20, min(2000, safe_float(policy.get("review_every_trials"), min_completed))))
+    return {
+        "mode": mode,
+        "min_completed_trials": min_completed,
+        "review_every_trials": every,
+        "reason": str(policy.get("reason", "")).strip(),
+    }
+
+
+def review_policy_stop_after(policy: dict[str, Any]) -> int:
+    if policy.get("mode") != "after_n_trials":
+        return 0
+    return int(policy.get("min_completed_trials", 0) or 0)
+
+
+def load_review_policy(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"mode": "full_round", "min_completed_trials": 0, "review_every_trials": 0, "reason": "No AI checkpoint policy yet."}
+    return normalize_review_policy(read_json(path))
 
 
 def strategy_map(strategy_file: Path) -> dict[str, dict[str, Any]]:
@@ -170,6 +221,11 @@ def summarize_results(rows: list[dict[str, str]]) -> dict[str, Any]:
     top_rows = rows[:12]
     passed = [row for row in rows if str(row.get("passed")).lower() == "true"]
     best = top_rows[0] if top_rows else {}
+    parameter_analysis = {
+        "top": summarize_parameter(rows, "top"),
+        "lookback": summarize_parameter(rows, "lookback"),
+        "rebalance_days": summarize_parameter(rows, "rebalance_days"),
+    }
     return {
         "tested": len(rows),
         "passed": len(passed),
@@ -193,7 +249,50 @@ def summarize_results(rows: list[dict[str, str]]) -> dict[str, Any]:
             }
             for row in top_rows
         ],
+        "parameter_analysis": parameter_analysis,
+        "failure_modes": summarize_failure_modes(rows),
     }
+
+
+def summarize_parameter(rows: list[dict[str, str]], field: str) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        key = str(int(safe_float(row.get(field), 0)))
+        groups.setdefault(key, []).append(row)
+    summary = {}
+    for key, items in sorted(groups.items(), key=lambda item: int(item[0])):
+        passed = [row for row in items if str(row.get("passed")).lower() == "true"]
+        summary[key] = {
+            "tested": len(items),
+            "passed": len(passed),
+            "avg_rank_score": round(sum(safe_float(row.get("rank_score"), -999.0) for row in items) / len(items), 6),
+            "avg_annual_return": round(sum(safe_float(row.get("annual_return")) for row in items) / len(items), 6),
+            "avg_max_drawdown": round(sum(safe_float(row.get("max_drawdown")) for row in items) / len(items), 6),
+            "avg_monthly_win_rate": round(sum(safe_float(row.get("monthly_win_rate")) for row in items) / len(items), 6),
+        }
+    return summary
+
+
+def summarize_failure_modes(rows: list[dict[str, str]]) -> dict[str, int]:
+    modes = {
+        "drawdown_over_20pct": 0,
+        "annual_return_below_8pct": 0,
+        "calmar_below_1": 0,
+        "monthly_win_rate_below_60pct": 0,
+        "max_monthly_loss_below_minus_5pct": 0,
+    }
+    for row in rows:
+        if abs(safe_float(row.get("max_drawdown"))) > 0.20:
+            modes["drawdown_over_20pct"] += 1
+        if safe_float(row.get("annual_return")) < 0.08:
+            modes["annual_return_below_8pct"] += 1
+        if safe_float(row.get("calmar")) < 1.0:
+            modes["calmar_below_1"] += 1
+        if safe_float(row.get("monthly_win_rate")) < 0.60:
+            modes["monthly_win_rate_below_60pct"] += 1
+        if safe_float(row.get("max_monthly_loss")) < -0.05:
+            modes["max_monthly_loss_below_minus_5pct"] += 1
+    return modes
 
 
 def normalize_weights(weights: dict[str, float]) -> dict[str, float]:
@@ -203,6 +302,36 @@ def normalize_weights(weights: dict[str, float]) -> dict[str, float]:
     if total <= 0:
         return {}
     return {factor: round(weight / total, 4) for factor, weight in sorted(cleaned.items())}
+
+
+def normalize_parameter_values(raw_values: Any, allowed: list[int], default_values: list[int]) -> list[int]:
+    if raw_values is None:
+        return list(default_values)
+    if not isinstance(raw_values, list):
+        raw_values = [raw_values]
+    values = []
+    for raw_value in raw_values:
+        try:
+            value = int(float(raw_value))
+        except Exception:
+            continue
+        if value in allowed and value not in values:
+            values.append(value)
+    return values or list(default_values)
+
+
+def normalize_parameter_grid(grid: Any) -> dict[str, list[int]]:
+    if not isinstance(grid, dict):
+        return {
+            "top": DEFAULT_TOP_VALUES,
+            "lookback": DEFAULT_LOOKBACK_VALUES,
+            "rebalance_days": DEFAULT_REBALANCE_VALUES,
+        }
+    return {
+        "top": normalize_parameter_values(grid.get("top"), DEFAULT_TOP_VALUES, DEFAULT_TOP_VALUES),
+        "lookback": normalize_parameter_values(grid.get("lookback"), DEFAULT_LOOKBACK_VALUES, DEFAULT_LOOKBACK_VALUES),
+        "rebalance_days": normalize_parameter_values(grid.get("rebalance_days"), DEFAULT_REBALANCE_VALUES, DEFAULT_REBALANCE_VALUES),
+    }
 
 
 def validate_agent_strategies(strategies: Any, allowed_factors: set[str], existing_names: set[str]) -> list[dict[str, Any]]:
@@ -244,11 +373,16 @@ def validate_agent_strategies(strategies: Any, allowed_factors: set[str], existi
         if not normalized:
             raise ValueError(f"Agent strategy {raw_name} has no usable positive weights.")
         seen.add(name)
-        cleaned.append({
+        cleaned_item = {
             "name": name,
             "weights": normalized,
             "description": str(item.get("description", "")).strip() or f"Codex generated strategy {name}.",
-        })
+            "parameter_grid": normalize_parameter_grid(item.get("parameter_grid")),
+        }
+        research_thesis = str(item.get("research_thesis", "")).strip()
+        if research_thesis:
+            cleaned_item["research_thesis"] = research_thesis
+        cleaned.append(cleaned_item)
     return cleaned
 
 
@@ -295,7 +429,7 @@ def generate_candidates(current: dict[str, dict[str, Any]], summary: dict[str, A
         base_weights = base.get("weights", {})
         drawdown = abs(safe_float(row.get("max_drawdown")))
         annual = safe_float(row.get("annual_return"))
-        if drawdown > 0.15:
+        if drawdown > 0.20:
             additions = DEFENSIVE_FACTORS
             style = "defensive"
             cuts = {"momentum", "liquidity_trend", "volume_trend"}
@@ -372,19 +506,24 @@ def build_agent_prompt(run_dir: Path, strategy_file: Path, summary: dict[str, An
         "# Convertible Bond Strategy Agent",
         "",
         "You are a Codex strategy research agent for a MiniQMT convertible-bond backtest loop.",
-        "Your job is to decide whether the search should continue and, only if useful, propose new factor-weight strategies.",
+        "Your job is to act like a quantitative research expert: diagnose historical backtest results, decide whether the search should continue, and, only if useful, propose new factor-weight strategies with strategy-specific parameter grids.",
         "",
         "Return exactly the JSON object required by the provided output schema.",
         "",
         "Rules:",
         "- Do not edit files or run commands.",
         "- Set stop=true when the history suggests further factor-weight tweaks are unlikely to add value.",
-        "- Set stop=false only when you can propose genuinely different strategy candidates.",
+        "- Set stop=false only when you can propose genuinely different strategy candidates backed by a research thesis.",
         "- Use only factors listed in available_factors.",
         "- Each strategy should use 3 to 8 factors with positive weights. Return weights as an array of {factor, weight}; the controller will normalize them.",
+        "- Each proposed strategy must include parameter_grid with top, lookback, and rebalance_days arrays chosen from top=[3,5,8], lookback=[40,60,90], rebalance_days=[10,20,40].",
+        "- Each proposed strategy should include research_thesis explaining why those factors and parameters are worth testing.",
+        "- Include diagnosis, avoid, and focus fields in your response: diagnosis explains what historical backtest results imply; avoid lists weak factors or parameter regions; focus lists the next research direction.",
+        "- Include review_policy to decide when you should inspect the next round. Use mode=after_n_trials with a professional checkpoint size when partial evidence is enough, or mode=full_round when the whole planned set is needed.",
         "- Avoid factors marked unavailable_or_weak unless the results strongly justify them.",
         "- Prefer a small number of high-quality new strategies, usually 1 to 5.",
-        "- Consider max drawdown, annual return, Calmar, monthly win rate, max monthly loss, trade count, and repeated lack of improvement.",
+        "- Do not brute-force the full grid by default. Use historical backtest results to narrow or change the next tests.",
+        "- Consider max drawdown, annual return, Calmar, monthly win rate, max monthly loss, trade count, parameter behavior, factor behavior, and repeated lack of improvement.",
         "",
         "Context JSON:",
         "```json",
@@ -467,6 +606,10 @@ def heuristic_decision(current: dict[str, dict[str, Any]], summary: dict[str, An
     return {
         "stop": stop,
         "reason": reason,
+        "diagnosis": "Heuristic fallback adjusted weights from recent top results; use Codex provider for full historical parameter attribution.",
+        "avoid": {},
+        "focus": {"source": "heuristic", "note": "Generated from best recent rows and hard-constraint failures."},
+        "review_policy": {"mode": "full_round", "min_completed_trials": 0, "review_every_trials": 0, "reason": "Heuristic fallback does not choose partial-review checkpoints."},
         "strategies": [item for item in next_strategies if item["name"] in proposed_names],
     }
 
@@ -476,7 +619,7 @@ def analyze_and_update(args: argparse.Namespace, run_dir: Path, round_index: int
     current = strategy_map(strategy_file)
     rows = sorted_results(run_dir)
     summary = summarize_results(rows)
-    history = previous_history()
+    history = [] if args.ignore_history else previous_history()
     prompt_text = build_agent_prompt(run_dir, strategy_file, summary, current, history)
     prompt_path = write_prompt(run_dir, prompt_text)
     if args.ai_provider == "codex":
@@ -494,7 +637,35 @@ def analyze_and_update(args: argparse.Namespace, run_dir: Path, round_index: int
     if not stop and proposed_count <= 0:
         stop = True
         reason = "Agent chose to continue but did not provide any valid new strategies."
+    diagnosis = str(agent_response.get("diagnosis", "")).strip()
+    avoid = agent_response.get("avoid", {})
+    focus = agent_response.get("focus", {})
+    review_policy = normalize_review_policy(agent_response.get("review_policy", {}))
     next_strategies = merge_strategy_pool(current, proposed, args.max_strategies)
+    print(
+        "ai_round_summary="
+        f"tested={summary.get('tested')} passed={summary.get('passed')} "
+        f"best={summary.get('best_strategy')} "
+        f"best_annual={summary.get('best_annual_return'):.6f} "
+        f"best_drawdown={summary.get('best_max_drawdown'):.6f} "
+        f"history_items={len(history)}",
+        flush=True,
+    )
+    print(f"ai_agent_decision=stop={stop} proposed={proposed_count} reason={reason}", flush=True)
+    if diagnosis:
+        print(f"ai_research_diagnosis={diagnosis}", flush=True)
+    print(
+        "ai_review_policy="
+        f"mode={review_policy.get('mode')} "
+        f"min_completed_trials={review_policy.get('min_completed_trials')} "
+        f"review_every_trials={review_policy.get('review_every_trials')} "
+        f"reason={review_policy.get('reason')}",
+        flush=True,
+    )
+    for item in proposed:
+        weights = ", ".join(f"{factor}:{weight}" for factor, weight in item.get("weights", {}).items())
+        grid = item.get("parameter_grid", {})
+        print(f"ai_proposed_strategy={item.get('name')} grid={grid} weights={weights} description={item.get('description', '')}", flush=True)
     decision = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "round_index": round_index,
@@ -504,6 +675,10 @@ def analyze_and_update(args: argparse.Namespace, run_dir: Path, round_index: int
         "proposed_count": proposed_count,
         "stop": stop,
         "reason": reason,
+        "diagnosis": diagnosis,
+        "avoid": avoid,
+        "focus": focus,
+        "review_policy": review_policy,
         "agent_response": agent_response,
     }
     decision["codex_prompt"] = str(prompt_path)
@@ -511,6 +686,7 @@ def analyze_and_update(args: argparse.Namespace, run_dir: Path, round_index: int
     AI_DIR.mkdir(parents=True, exist_ok=True)
     write_json(AI_DIR / f"{run_dir.name}_decision.json", decision)
     append_jsonl(HISTORY_FILE, decision)
+    write_json(Path(args.review_policy_file), review_policy)
 
     if not stop:
         payload = {

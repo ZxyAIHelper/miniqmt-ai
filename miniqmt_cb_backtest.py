@@ -39,6 +39,9 @@ WORKER_DATA: dict[str, pd.DataFrame] | None = None
 WORKER_ARGS: argparse.Namespace | None = None
 WORKER_STOCK_DATA: dict[str, pd.DataFrame] | None = None
 ACTIVE_STRATEGIES: list[dict[str, Any]] = []
+DEFAULT_TOP_VALUES = [3, 5, 8]
+DEFAULT_LOOKBACK_VALUES = [40, 60, 90]
+DEFAULT_REBALANCE_VALUES = [10, 20, 40]
 
 
 FACTOR_DESCRIPTIONS = {
@@ -178,7 +181,7 @@ class Position:
     cost: float
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args_from(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MiniQMT convertible-bond backtest with buy/sell trade records.")
     parser.add_argument("--start", default=three_years_ago())
     parser.add_argument("--end", default=datetime.now().strftime("%Y%m%d"))
@@ -191,10 +194,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cash", type=float, default=10000.0)
     parser.add_argument("--fee-rate", type=float, default=0.0002)
     parser.add_argument("--slippage-rate", type=float, default=0.0005)
-    parser.add_argument("--max-drawdown", type=float, default=0.15, help="Maximum allowed drawdown for optimize mode.")
+    parser.add_argument("--max-drawdown", type=float, default=0.20, help="Maximum allowed drawdown for optimize mode.")
     parser.add_argument("--optimize", action="store_true", help="Search strategy/parameter combinations and keep the best under max drawdown.")
     parser.add_argument("--workers", type=int, default=default_workers(), help="Parallel worker processes for optimize mode.")
-    return parser.parse_args()
+    parser.add_argument("--stop-after-trials", type=int, default=0, help="Optimize mode checkpoint size. 0 means run all generated trials.")
+    values = argv[1:] if argv is not None else None
+    return parser.parse_args(values)
+
+
+def parse_args() -> argparse.Namespace:
+    return parse_args_from()
+
+
+def validate_requested_strategy(args: argparse.Namespace, strategy_names: set[str]) -> None:
+    if args.optimize:
+        return
+    if args.strategy not in strategy_names:
+        raise ValueError(f"Strategy {args.strategy!r} is not in {args.strategy_file}. Available: {', '.join(sorted(strategy_names))}")
 
 
 def three_years_ago() -> str:
@@ -276,12 +292,44 @@ def validate_strategies(strategies: Any, source: str) -> list[dict[str, Any]]:
                 raise ValueError(f"Strategy {name} has invalid weight for {factor_name}: {weight}")
             clean_weights[factor_name] = factor_weight
         seen.add(name)
-        cleaned.append({
+        cleaned_item = {
             "name": name,
             "weights": clean_weights,
             "description": safe_text(item.get("description")),
-        })
+        }
+        parameter_grid = normalize_parameter_grid(item.get("parameter_grid"))
+        if parameter_grid:
+            cleaned_item["parameter_grid"] = parameter_grid
+        if safe_text(item.get("research_thesis")).strip():
+            cleaned_item["research_thesis"] = safe_text(item.get("research_thesis")).strip()
+        cleaned.append(cleaned_item)
     return cleaned
+
+
+def normalize_parameter_values(raw_values: Any, allowed: list[int], default_values: list[int]) -> list[int]:
+    if raw_values is None:
+        return list(default_values)
+    if not isinstance(raw_values, list):
+        raw_values = [raw_values]
+    values = []
+    for raw_value in raw_values:
+        try:
+            value = int(float(raw_value))
+        except Exception:
+            continue
+        if value in allowed and value not in values:
+            values.append(value)
+    return values or list(default_values)
+
+
+def normalize_parameter_grid(grid: Any) -> dict[str, list[int]]:
+    if not isinstance(grid, dict):
+        return {}
+    return {
+        "top": normalize_parameter_values(grid.get("top"), DEFAULT_TOP_VALUES, DEFAULT_TOP_VALUES),
+        "lookback": normalize_parameter_values(grid.get("lookback"), DEFAULT_LOOKBACK_VALUES, DEFAULT_LOOKBACK_VALUES),
+        "rebalance_days": normalize_parameter_values(grid.get("rebalance_days"), DEFAULT_REBALANCE_VALUES, DEFAULT_REBALANCE_VALUES),
+    }
 
 
 def ensure_strategy_file(path: str) -> None:
@@ -1018,7 +1066,7 @@ def write_target_constraints() -> None:
     rows = [
         {"constraint": "initial_cash", "value": "10000", "source": TARGET_FILE},
         {"constraint": "annual_return_min", "value": "0.08", "source": TARGET_FILE},
-        {"constraint": "max_drawdown_max", "value": "0.15", "source": TARGET_FILE},
+        {"constraint": "max_drawdown_max", "value": "0.20", "source": TARGET_FILE},
         {"constraint": "calmar_min", "value": "1.0", "source": TARGET_FILE},
         {"constraint": "monthly_win_rate_min", "value": "0.60", "source": TARGET_FILE},
         {"constraint": "max_monthly_loss_min", "value": "-0.05", "source": TARGET_FILE},
@@ -1196,18 +1244,24 @@ def optimize_fields() -> list[str]:
     ]
 
 
-def strategy_trials() -> list[tuple[str, int, int, int]]:
-    strategies = [item["name"] for item in ACTIVE_STRATEGIES]
-    tops = [3, 5, 8]
-    lookbacks = [40, 60, 90]
-    rebalance_days = [10, 20, 40]
-    return [
-        (strategy, top, lookback, rebalance_day)
-        for strategy in strategies
-        for top in tops
-        for lookback in lookbacks
-        for rebalance_day in rebalance_days
-    ]
+def strategy_trials(args: argparse.Namespace | None = None) -> list[tuple[str, int, int, int]]:
+    trials = []
+    for item in ACTIVE_STRATEGIES:
+        grid = normalize_parameter_grid(item.get("parameter_grid")) or {
+            "top": DEFAULT_TOP_VALUES,
+            "lookback": DEFAULT_LOOKBACK_VALUES,
+            "rebalance_days": DEFAULT_REBALANCE_VALUES,
+        }
+        trials.extend(
+            (item["name"], top, lookback, rebalance_day)
+            for top in grid["top"]
+            for lookback in grid["lookback"]
+            for rebalance_day in grid["rebalance_days"]
+        )
+    stop_after = int(getattr(args, "stop_after_trials", 0) or 0) if args is not None else 0
+    if stop_after > 0:
+        return trials[:stop_after]
+    return trials
 
 
 def result_for_trial(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None, run_id: str, trial: tuple[str, int, int, int]) -> tuple[dict[str, Any], argparse.Namespace]:
@@ -1250,7 +1304,7 @@ def worker_trial(payload: tuple[str, tuple[str, int, int, int]]) -> tuple[dict[s
 
 
 def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    trials = strategy_trials()
+    trials = strategy_trials(args)
     rows = []
     best: dict[str, Any] | None = None
     run_id = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1310,8 +1364,7 @@ def main() -> int:
     set_active_strategies(strategies)
     args.strategy_candidates = strategies
     strategy_names = {item["name"] for item in strategies}
-    if args.strategy not in strategy_names:
-        raise ValueError(f"Strategy {args.strategy!r} is not in {args.strategy_file}. Available: {', '.join(sorted(strategy_names))}")
+    validate_requested_strategy(args, strategy_names)
     print("=" * 72)
     print("MiniQMT convertible-bond backtest")
     print(f"range={args.start}-{args.end} limit={args.limit} top={args.top}")

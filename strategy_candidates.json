@@ -1,18 +1,7 @@
 {
   "version": 1,
-  "notes": "Updated by strategy_iteration_loop.py after run 20260526155355.",
+  "notes": "Updated by strategy_iteration_loop.py after run 20260526225553.",
   "strategies": [
-    {
-      "name": "balanced_defensive",
-      "weights": {
-        "price_band": 0.25,
-        "low_volatility": 0.2,
-        "liquidity": 0.2,
-        "drawdown_control": 0.2,
-        "momentum": 0.15
-      },
-      "description": "Balanced low price, low volatility, liquidity, and trend."
-    },
     {
       "name": "liquid_low_vol",
       "weights": {
@@ -286,6 +275,123 @@
         "trend_filter": 0.2
       },
       "description": "A genuinely different channel-position approach that blends price-channel recovery with trend confirmation and explicit tail-risk control."
+    },
+    {
+      "name": "ai_r3_channel_gap_downside_guard",
+      "weights": {
+        "liquidity": 0.08,
+        "low_downside_volatility": 0.13,
+        "low_gap_risk": 0.16,
+        "price_position": 0.22,
+        "short_reversal": 0.12,
+        "tail_loss_control": 0.11,
+        "trend_filter": 0.18
+      },
+      "description": "Keeps the winning channel-position and trend core, but shifts weight from pure reversal into gap, downside-volatility, and tail-loss controls to target lower drawdown and monthly loss."
+    },
+    {
+      "name": "ai_r3_channel_band_drawdown_stable",
+      "weights": {
+        "drawdown_control": 0.16,
+        "liquidity_stability": 0.06,
+        "low_gap_risk": 0.1,
+        "low_volatility": 0.13,
+        "price_band": 0.18,
+        "price_position": 0.2,
+        "trend_filter": 0.17
+      },
+      "description": "Blends channel recovery with price-band discipline and explicit drawdown/volatility controls, aiming to preserve return while moving closer to the drawdown constraint."
+    },
+    {
+      "name": "ai_r3_consistent_channel_trend",
+      "weights": {
+        "liquidity": 0.1,
+        "low_downside_volatility": 0.13,
+        "low_gap_risk": 0.1,
+        "price_position": 0.2,
+        "short_reversal": 0.11,
+        "trend_filter": 0.2,
+        "up_day_consistency": 0.16
+      },
+      "description": "Tests whether the channel-recovery edge improves monthly win rate when combined with up-day consistency and moderate downside controls."
+    },
+    {
+      "name": "ai_r4_channel_structural_safety",
+      "weights": {
+        "force_redeem_safety": 0.15,
+        "listed_days": 0.1,
+        "low_gap_risk": 0.12,
+        "price_position": 0.22,
+        "remaining_size": 0.12,
+        "short_reversal": 0.11,
+        "trend_filter": 0.18
+      },
+      "description": "Keeps the channel recovery edge but adds forced-redemption, size, and listing-age controls to test whether structural bond filters reduce drawdown without relying on weak premium data."
+    },
+    {
+      "name": "ai_r4_low_price_channel_guard",
+      "weights": {
+        "liquidity": 0.1,
+        "low_gap_risk": 0.12,
+        "low_price": 0.16,
+        "price_band": 0.14,
+        "price_position": 0.2,
+        "tail_loss_control": 0.1,
+        "trend_filter": 0.18
+      },
+      "description": "Tests whether adding low-price discipline to the successful channel setup improves downside behavior while retaining trend and gap controls."
+    },
+    {
+      "name": "ai_r4_consistency_size_downside",
+      "weights": {
+        "force_redeem_safety": 0.1,
+        "liquidity_stability": 0.1,
+        "low_downside_volatility": 0.18,
+        "price_band": 0.14,
+        "remaining_size": 0.12,
+        "trend_filter": 0.16,
+        "up_day_consistency": 0.2
+      },
+      "description": "A more defensive alternative emphasizing positive-day consistency, downside volatility, stable liquidity, and remaining size to see if monthly win rate and drawdown improve versus channel-heavy variants."
+    },
+    {
+      "name": "ai_next_channel_drawdown_tail_core",
+      "weights": {
+        "drawdown_control": 0.14,
+        "low_downside_volatility": 0.12,
+        "low_gap_risk": 0.1,
+        "price_position": 0.24,
+        "short_reversal": 0.12,
+        "tail_loss_control": 0.08,
+        "trend_filter": 0.2
+      },
+      "description": "Concentrates the proven channel recovery edge while replacing weak return-chasing exposure with explicit drawdown, downside volatility, gap, and tail controls."
+    },
+    {
+      "name": "ai_next_band_channel_low_price_guard",
+      "weights": {
+        "liquidity": 0.08,
+        "low_gap_risk": 0.1,
+        "low_price": 0.14,
+        "low_volatility": 0.1,
+        "price_band": 0.18,
+        "price_position": 0.22,
+        "trend_filter": 0.18
+      },
+      "description": "Tests whether low-price and preferred-band discipline can reduce the large drawdown seen in the highest-return channel strategy while keeping channel and trend exposure."
+    },
+    {
+      "name": "ai_next_consistency_downside_liquid",
+      "weights": {
+        "drawdown_control": 0.1,
+        "liquidity": 0.06,
+        "liquidity_stability": 0.1,
+        "low_downside_volatility": 0.2,
+        "price_band": 0.16,
+        "trend_filter": 0.16,
+        "up_day_consistency": 0.22
+      },
+      "description": "A non-channel control candidate focused on monthly win-rate and drawdown behavior through consistency, downside volatility, liquidity quality, and price-band discipline."
     }
   ]
 }

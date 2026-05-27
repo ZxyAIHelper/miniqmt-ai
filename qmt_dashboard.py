@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "qmt_outputs"
 RUNS_DIR = OUTPUT_DIR / "runs"
 AI_REVIEWS_DIR = OUTPUT_DIR / "ai_reviews"
+LOGS_DIR = OUTPUT_DIR / "logs"
 STRATEGY_FILE = BASE_DIR / "strategy_candidates.json"
 BACKTEST_SCRIPT = BASE_DIR / "miniqmt_cb_backtest.py"
 JOBS: dict[str, dict[str, Any]] = {}
@@ -157,6 +159,38 @@ HTML = r"""<!doctype html>
       font-weight: 650;
       line-height: 1.1;
     }
+    .progress-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 11px 12px;
+      margin-bottom: 14px;
+      display: grid;
+      grid-template-columns: minmax(240px, 1.2fr) repeat(4, minmax(90px, .6fr));
+      gap: 10px;
+      align-items: center;
+    }
+    .progress-panel .label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+    .progress-panel .value {
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }
+    .progress-track {
+      grid-column: 1 / -1;
+      height: 9px;
+      background: #e8edf3;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0;
+      background: var(--accent);
+    }
     .layout {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 370px;
@@ -167,6 +201,12 @@ HTML = r"""<!doctype html>
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 7px;
+      min-width: 0;
+    }
+    .side-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
       min-width: 0;
     }
     .panel-head {
@@ -235,6 +275,45 @@ HTML = r"""<!doctype html>
       display: flex;
       flex-direction: column;
       gap: 12px;
+    }
+    .ai-decision {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .ai-reason {
+      border: 1px solid #edf0f4;
+      border-radius: 6px;
+      padding: 9px;
+      line-height: 1.55;
+      color: #334155;
+      background: #fbfcfe;
+      white-space: pre-wrap;
+    }
+    .ai-strategy {
+      border: 1px solid #edf0f4;
+      border-radius: 6px;
+      padding: 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .ai-strategy strong {
+      overflow-wrap: anywhere;
+    }
+    .ai-mini {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .ai-mini span {
+      border: 1px solid #d8e1ec;
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 12px;
+      background: #f8fafc;
+      color: #3d4758;
     }
     .kv {
       display: grid;
@@ -311,6 +390,14 @@ HTML = r"""<!doctype html>
           <button class="btn primary" id="rerunBtn" disabled>按当前策略重新回测</button>
         </div>
       </div>
+      <section id="aiStatus" class="progress-panel">
+        <div><div class="label">后台任务</div><div class="value" id="aiStatusStage">加载中</div></div>
+        <div><div class="label">轮次</div><div class="value" id="aiStatusRound">-</div></div>
+        <div><div class="label">进度</div><div class="value" id="aiStatusProgress">-</div></div>
+        <div><div class="label">剩余</div><div class="value" id="aiStatusRemaining">-</div></div>
+        <div><div class="label">最新 run</div><div class="value" id="aiStatusRun">-</div></div>
+        <div class="progress-track"><div id="aiStatusFill" class="progress-fill"></div></div>
+      </section>
       <section class="grid" id="metrics"></section>
       <section class="layout">
         <div class="panel">
@@ -348,13 +435,33 @@ HTML = r"""<!doctype html>
             </table>
           </div>
         </div>
-        <div class="panel">
-          <div class="panel-head">
-            <strong>单策略详情</strong>
-            <span id="detailBadge" class="tag">未选择</span>
+        <div class="side-stack">
+          <div class="panel">
+            <div class="panel-head">
+              <strong>单策略详情</strong>
+              <span id="detailBadge" class="tag">未选择</span>
+            </div>
+            <div id="detail" class="detail">
+              <div class="subtle">点击左侧表格中的一条结果查看参数、权重和重跑入口。</div>
+            </div>
           </div>
-          <div id="detail" class="detail">
-            <div class="subtle">点击左侧表格中的一条结果查看参数、权重和重跑入口。</div>
+          <div class="panel">
+            <div class="panel-head">
+              <strong>AI 如何选择</strong>
+              <span id="aiDecisionBadge" class="tag">未生成</span>
+            </div>
+            <div id="aiDecision" class="ai-decision">
+              <div class="subtle">这轮还没有 AI 决策记录；回测结束后会显示继续/停止原因和新策略权重。</div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <strong>AI 研究思路</strong>
+              <span class="tag">历史归因</span>
+            </div>
+            <div id="aiResearch" class="ai-decision">
+              <div class="subtle">回测结束并完成 AI 决策后，这里会显示诊断、规避方向和下一轮重点。</div>
+            </div>
           </div>
         </div>
       </section>
@@ -362,7 +469,7 @@ HTML = r"""<!doctype html>
     </main>
   </div>
   <script>
-    const state = { runs: [], selectedRun: "", results: [], definitions: {}, candidates: {}, selected: null, sort: "rank_score", desc: true };
+    const state = { runs: [], selectedRun: "", results: [], definitions: {}, candidates: {}, decision: {}, selected: null, sort: "rank_score", desc: true };
     const numericFields = new Set(["rank_score","annual_return","max_drawdown","calmar","sharpe","monthly_win_rate","max_monthly_loss","top","lookback","rebalance_days","trade_count"]);
     const $ = id => document.getElementById(id);
 
@@ -384,6 +491,15 @@ HTML = r"""<!doctype html>
     function boolText(v) {
       return String(v).toLowerCase() === "true" ? "通过" : "未通过";
     }
+    function esc(v) {
+      return String(v ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
     async function api(path, options) {
       const res = await fetch(path, options);
       if (!res.ok) throw new Error(await res.text());
@@ -396,6 +512,21 @@ HTML = r"""<!doctype html>
       renderRuns();
       if (state.selectedRun) await loadRun(state.selectedRun);
     }
+    async function refreshAIStatus() {
+      try {
+        const data = await api("/api/ai-status");
+        const pctValue = Number(data.percent || 0);
+        $("aiStatusStage").textContent = data.stage || "-";
+        $("aiStatusRound").textContent = data.round || "-";
+        $("aiStatusProgress").textContent = data.progress_total ? `${data.progress_current} / ${data.progress_total} (${pctValue.toFixed(1)}%)` : "-";
+        $("aiStatusRemaining").textContent = data.remaining ?? "-";
+        $("aiStatusRun").textContent = data.latest_run || "-";
+        $("aiStatusFill").style.width = `${Math.max(0, Math.min(100, pctValue))}%`;
+      } catch (err) {
+        $("aiStatusStage").textContent = "状态读取失败";
+        $("aiStatusProgress").textContent = err.message;
+      }
+    }
     async function loadRun(runId) {
       state.selectedRun = runId;
       state.selected = null;
@@ -403,12 +534,15 @@ HTML = r"""<!doctype html>
       state.results = data.results || [];
       state.definitions = data.definitions || {};
       state.candidates = data.candidates || {};
+      state.decision = data.decision || {};
       $("title").textContent = `策略搜索结果 ${runId}`;
       $("runMeta").textContent = data.path || "";
       renderRuns();
       renderMetrics();
       renderTable();
       renderDetail();
+      renderAIDecision();
+      renderAIResearch();
     }
     function renderRuns() {
       $("runList").innerHTML = state.runs.map(run => `
@@ -519,6 +653,107 @@ HTML = r"""<!doctype html>
         </div>
       `;
     }
+    function normalizeAgentWeights(weights) {
+      if (Array.isArray(weights)) return weights.map(item => [item.factor, item.weight]);
+      return Object.entries(weights || {});
+    }
+    function renderAgentWeights(weights) {
+      const entries = normalizeAgentWeights(weights).filter(([factor]) => factor);
+      if (!entries.length) return "";
+      return `<div class="ai-mini">${entries.map(([factor, weight]) => `<span>${esc(factor)} ${Number(weight).toFixed(3)}</span>`).join("")}</div>`;
+    }
+    function renderAIDecision() {
+      const decision = state.decision || {};
+      const hasDecision = Boolean(decision.time || decision.reason || decision.agent_response);
+      if (!hasDecision) {
+        $("aiDecisionBadge").textContent = "未生成";
+        $("aiDecision").innerHTML = `<div class="subtle">这轮还没有 AI 决策记录；回测结束后会显示继续/停止原因和新策略权重。</div>`;
+        return;
+      }
+      const response = decision.agent_response || {};
+      const strategies = Array.isArray(response.strategies) ? response.strategies : [];
+      $("aiDecisionBadge").textContent = decision.stop ? "停止" : "继续";
+      const summary = decision.summary || {};
+      $("aiDecision").innerHTML = `
+        <div class="kv">
+          <div><span>时间</span><strong>${esc(decision.time || "-")}</strong></div>
+          <div><span>轮次</span><strong>${esc(decision.round_index ?? "-")}</strong></div>
+          <div><span>测试/通过</span><strong>${esc(summary.tested ?? "-")} / ${esc(summary.passed ?? "-")}</strong></div>
+          <div><span>新增策略</span><strong>${esc(decision.proposed_count ?? strategies.length)}</strong></div>
+        </div>
+        <div>
+          <h2>决策原因</h2>
+          <div class="ai-reason">${esc(decision.reason || response.reason || "-")}</div>
+        </div>
+        <div>
+          <h2>AI 提出的策略</h2>
+          ${strategies.length ? strategies.map(item => `
+            <div class="ai-strategy">
+              <strong>${esc(item.name || "-")}</strong>
+              <div class="subtle">${esc(item.description || "")}</div>
+              ${renderAgentWeights(item.weights)}
+            </div>
+          `).join("") : `<div class="subtle">本轮 AI 没有提出新的有效策略。</div>`}
+        </div>
+        ${decision.codex_prompt ? `<div class="subtle">Prompt: ${esc(decision.codex_prompt)}</div>` : ""}
+      `;
+    }
+    function renderListBlock(value) {
+      if (!value) return `<div class="subtle">-</div>`;
+      if (typeof value === "string") return `<div class="ai-reason">${esc(value)}</div>`;
+      return `<div class="ai-reason">${esc(JSON.stringify(value, null, 2))}</div>`;
+    }
+    function renderStrategyGrid(item) {
+      const grid = item.parameter_grid || {};
+      const parts = [
+        ["持仓", grid.top],
+        ["回看", grid.lookback],
+        ["调仓", grid.rebalance_days]
+      ].filter(([, values]) => Array.isArray(values) && values.length);
+      if (!parts.length) return "";
+      return `<div class="ai-mini">${parts.map(([label, values]) => `<span>${label}: ${values.join(", ")}</span>`).join("")}</div>`;
+    }
+    function renderAIResearch() {
+      const decision = state.decision || {};
+      const response = decision.agent_response || {};
+      const strategies = Array.isArray(response.strategies) ? response.strategies : [];
+      const diagnosis = decision.diagnosis || response.diagnosis || "";
+      const avoid = decision.avoid || response.avoid || null;
+      const focus = decision.focus || response.focus || null;
+      const reviewPolicy = decision.review_policy || response.review_policy || null;
+      if (!diagnosis && !avoid && !focus && !reviewPolicy && !strategies.some(item => item.research_thesis || item.parameter_grid)) {
+        $("aiResearch").innerHTML = `<div class="subtle">这轮还没有 AI 研究归因；新的决策会显示诊断、规避方向、重点方向和参数选择理由。</div>`;
+        return;
+      }
+      $("aiResearch").innerHTML = `
+        <div>
+          <h2>历史结果诊断</h2>
+          ${renderListBlock(diagnosis)}
+        </div>
+        <div>
+          <h2>规避方向</h2>
+          ${renderListBlock(avoid)}
+        </div>
+        <div>
+          <h2>下一轮重点</h2>
+          ${renderListBlock(focus)}
+        </div>
+        <div>
+          <h2>接手机制</h2>
+          ${renderListBlock(reviewPolicy)}
+        </div>
+        <div>
+          <h2>策略参数理由</h2>
+          ${strategies.length ? strategies.map(item => `
+            <div class="ai-strategy">
+              <strong>${esc(item.name || "-")}</strong>
+              <div class="subtle">${esc(item.research_thesis || item.description || "")}</div>
+              ${renderStrategyGrid(item)}
+            </div>
+          `).join("") : `<div class="subtle">本轮没有新策略参数建议。</div>`}
+        </div>
+      `;
+    }
     async function rerunSelected() {
       if (!state.selected) return;
       $("status").textContent = "已提交重新回测任务...";
@@ -565,6 +800,8 @@ HTML = r"""<!doctype html>
       renderTable();
     });
     loadRuns().catch(err => $("status").textContent = "加载失败: " + err.message);
+    refreshAIStatus();
+    setInterval(refreshAIStatus, 5000);
   </script>
 </body>
 </html>
@@ -623,6 +860,63 @@ def decision_for_run(run_id: str) -> dict[str, Any]:
     if direct.exists():
         return read_json(direct)
     return {}
+
+
+def parse_ai_iteration_status(log_text: str) -> dict[str, Any]:
+    round_matches = re.findall(r"iteration_round=([^\s]+)", log_text)
+    progress_matches = re.findall(r"optimize_progress=(\d+)/(\d+)", log_text)
+    trial_matches = re.findall(r"optimize_workers=\d+\s+trials=(\d+)", log_text)
+    current = total = 0
+    if progress_matches:
+        current, total = (int(progress_matches[-1][0]), int(progress_matches[-1][1]))
+    elif trial_matches:
+        total = int(trial_matches[-1])
+
+    if "ai_stop_reason=" in log_text:
+        stage = "AI 已停止"
+    elif "launch_codex_agent=" in log_text and log_text.rfind("launch_codex_agent=") > log_text.rfind("ai_agent_decision="):
+        stage = "AI 决策中"
+    elif total and current >= total:
+        stage = "等待 AI 决策"
+    elif total:
+        stage = "回测中"
+    else:
+        stage = "等待启动"
+
+    percent = round(current / total * 100, 1) if total else 0.0
+    return {
+        "stage": stage,
+        "round": round_matches[-1] if round_matches else "",
+        "progress_current": current,
+        "progress_total": total,
+        "remaining": max(total - current, 0) if total else None,
+        "percent": percent,
+    }
+
+
+def latest_ai_status() -> dict[str, Any]:
+    logs = sorted(LOGS_DIR.glob("ai_iteration_*_stdout.log"), key=lambda p: p.stat().st_mtime, reverse=True) if LOGS_DIR.exists() else []
+    latest_run = run_dirs()[0].name if run_dirs() else ""
+    if not logs:
+        return {
+            "stage": "没有 AI 迭代日志",
+            "round": "",
+            "progress_current": 0,
+            "progress_total": 0,
+            "remaining": None,
+            "percent": 0.0,
+            "latest_run": latest_run,
+            "log": "",
+        }
+    path = logs[0]
+    text = path.read_text(encoding="utf-8", errors="replace")
+    status = parse_ai_iteration_status(text)
+    status.update({
+        "latest_run": latest_run,
+        "log": str(path),
+        "modified": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return status
 
 
 def summarize_results(rows: list[dict[str, str]]) -> dict[str, Any]:
@@ -720,6 +1014,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/runs":
             write_json(self, {"runs": [run_info(path) for path in run_dirs()]})
+            return
+        if path == "/api/ai-status":
+            write_json(self, latest_ai_status())
             return
         if path.startswith("/api/runs/"):
             run_id = path.split("/")[-1]
