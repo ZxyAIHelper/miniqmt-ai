@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 import miniqmt_cb_backtest
 import qmt_dashboard
 import strategy_iteration_loop
@@ -117,6 +119,35 @@ class DrawdownTargetTests(unittest.TestCase):
         })
         self.assertIn("stable", strategies[0]["research_thesis"])
 
+    def test_ai_strategy_validation_preserves_risk_overlay(self):
+        strategies = strategy_iteration_loop.validate_agent_strategies(
+            [
+                {
+                    "name": "risk_agent",
+                    "description": "Use AI selected risk rules.",
+                    "research_thesis": "The factor space is exhausted, so test drawdown-aware exposure.",
+                    "weights": [
+                        {"factor": "price_band", "weight": 0.5},
+                        {"factor": "low_volatility", "weight": 0.5},
+                    ],
+                    "parameter_grid": {"top": [5], "lookback": [60], "rebalance_days": [20]},
+                    "risk_overlay": {
+                        "cash_reserve": 0.1,
+                        "stop_loss_pct": 0.08,
+                        "take_profit_pct": 0.5,
+                        "drawdown_reduce_threshold": 0.12,
+                        "reduced_exposure": 0.4,
+                    },
+                }
+            ],
+            {"price_band", "low_volatility"},
+            set(),
+        )
+
+        self.assertEqual(strategies[0]["risk_overlay"]["cash_reserve"], 0.1)
+        self.assertEqual(strategies[0]["risk_overlay"]["stop_loss_pct"], 0.08)
+        self.assertEqual(strategies[0]["risk_overlay"]["reduced_exposure"], 0.4)
+
     def test_strategy_trials_use_strategy_specific_parameter_grid(self):
         miniqmt_cb_backtest.set_active_strategies([
             {
@@ -156,6 +187,10 @@ class DrawdownTargetTests(unittest.TestCase):
         self.assertIn('id="aiResearch"', qmt_dashboard.HTML)
         self.assertIn("renderAIResearch", qmt_dashboard.HTML)
         self.assertIn("接手机制", qmt_dashboard.HTML)
+
+    def test_dashboard_can_render_ai_risk_overlay(self):
+        self.assertIn("renderRiskOverlay", qmt_dashboard.HTML)
+        self.assertIn("item.risk_overlay", qmt_dashboard.HTML)
 
     def test_result_summary_includes_parameter_analysis_for_ai_research(self):
         rows = [
@@ -249,6 +284,51 @@ class DrawdownTargetTests(unittest.TestCase):
             conn.commit()
             self.assertEqual(miniqmt_cb_backtest.factor_row_count(conn, "20260101", 40), 0)
             conn.close()
+
+    def test_backtest_risk_overlay_generates_stop_loss_sell(self):
+        dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"])
+        data = {
+            "110000.SH": pd.DataFrame(
+                {
+                    "open": [100.0, 100.0, 90.0, 90.0],
+                    "high": [100.0, 100.0, 90.0, 90.0],
+                    "low": [100.0, 100.0, 90.0, 90.0],
+                    "close": [100.0, 100.0, 90.0, 90.0],
+                    "volume": [1000, 1000, 1000, 1000],
+                    "amount": [100000, 100000, 90000, 90000],
+                },
+                index=dates,
+            )
+        }
+        factor_cache = {
+            (1, "20260102"): {"110000.SH": {"price_band": 1.0}},
+            (1, "20260103"): {"110000.SH": {"price_band": 1.0}},
+            (1, "20260104"): {"110000.SH": {"price_band": 1.0}},
+        }
+        miniqmt_cb_backtest.set_active_strategies([
+            {
+                "name": "stop_loss_test",
+                "weights": {"price_band": 1.0},
+                "risk_overlay": {"stop_loss_pct": 0.05},
+            }
+        ])
+        args = miniqmt_cb_backtest.parse_args_from([
+            "miniqmt_cb_backtest.py",
+            "--strategy",
+            "stop_loss_test",
+            "--lookback",
+            "1",
+            "--rebalance-days",
+            "10",
+            "--top",
+            "1",
+            "--cash",
+            "10000",
+        ])
+
+        trades, _, _ = miniqmt_cb_backtest.run_backtest(args, data, factor_cache=factor_cache)
+
+        self.assertTrue(any(row["side"] == "sell" and row["reason"] == "stop_loss" for row in trades))
 
 
 if __name__ == "__main__":

@@ -56,6 +56,13 @@ WEAK_OR_UNAVAILABLE_FACTORS = {
 DEFAULT_TOP_VALUES = [3, 5, 8]
 DEFAULT_LOOKBACK_VALUES = [40, 60, 90]
 DEFAULT_REBALANCE_VALUES = [10, 20, 40]
+RISK_OVERLAY_LIMITS = {
+    "cash_reserve": (0.0, 0.8),
+    "stop_loss_pct": (0.0, 0.35),
+    "take_profit_pct": (0.0, 1.5),
+    "drawdown_reduce_threshold": (0.0, 0.5),
+    "reduced_exposure": (0.0, 1.0),
+}
 
 
 def parse_args_from(argv: list[str] | None = None) -> argparse.Namespace:
@@ -334,6 +341,33 @@ def normalize_parameter_grid(grid: Any) -> dict[str, list[int]]:
     }
 
 
+def clamp_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    number = safe_float(value, default)
+    return round(max(minimum, min(maximum, number)), 6)
+
+
+def normalize_risk_overlay(overlay: Any) -> dict[str, float]:
+    if not isinstance(overlay, dict):
+        return {
+            "cash_reserve": 0.0,
+            "stop_loss_pct": 0.0,
+            "take_profit_pct": 0.0,
+            "drawdown_reduce_threshold": 0.0,
+            "reduced_exposure": 1.0,
+        }
+    defaults = {
+        "cash_reserve": 0.0,
+        "stop_loss_pct": 0.0,
+        "take_profit_pct": 0.0,
+        "drawdown_reduce_threshold": 0.0,
+        "reduced_exposure": 1.0,
+    }
+    return {
+        key: clamp_float(overlay.get(key), defaults[key], minimum, maximum)
+        for key, (minimum, maximum) in RISK_OVERLAY_LIMITS.items()
+    }
+
+
 def validate_agent_strategies(strategies: Any, allowed_factors: set[str], existing_names: set[str]) -> list[dict[str, Any]]:
     if not isinstance(strategies, list):
         raise ValueError("Agent decision field 'strategies' must be a list.")
@@ -378,6 +412,7 @@ def validate_agent_strategies(strategies: Any, allowed_factors: set[str], existi
             "weights": normalized,
             "description": str(item.get("description", "")).strip() or f"Codex generated strategy {name}.",
             "parameter_grid": normalize_parameter_grid(item.get("parameter_grid")),
+            "risk_overlay": normalize_risk_overlay(item.get("risk_overlay")),
         }
         research_thesis = str(item.get("research_thesis", "")).strip()
         if research_thesis:
@@ -506,23 +541,25 @@ def build_agent_prompt(run_dir: Path, strategy_file: Path, summary: dict[str, An
         "# Convertible Bond Strategy Agent",
         "",
         "You are a Codex strategy research agent for a MiniQMT convertible-bond backtest loop.",
-        "Your job is to act like a quantitative research expert: diagnose historical backtest results, decide whether the search should continue, and, only if useful, propose new factor-weight strategies with strategy-specific parameter grids.",
+        "Your job is to act like a quantitative research expert: diagnose historical backtest results, decide whether the search should continue, and, only if useful, propose new factor-weight strategies with strategy-specific parameter grids and risk overlays.",
         "",
         "Return exactly the JSON object required by the provided output schema.",
         "",
         "Rules:",
         "- Do not edit files or run commands.",
-        "- Set stop=true when the history suggests further factor-weight tweaks are unlikely to add value.",
+        "- Set stop=true only when the history suggests further changes to factor weights, parameter grids, and risk overlays are unlikely to add value.",
         "- Set stop=false only when you can propose genuinely different strategy candidates backed by a research thesis.",
         "- Use only factors listed in available_factors.",
         "- Each strategy should use 3 to 8 factors with positive weights. Return weights as an array of {factor, weight}; the controller will normalize them.",
         "- Each proposed strategy must include parameter_grid with top, lookback, and rebalance_days arrays chosen from top=[3,5,8], lookback=[40,60,90], rebalance_days=[10,20,40].",
+        "- Each proposed strategy must include risk_overlay. Available fields are cash_reserve 0.0-0.8, stop_loss_pct 0.0-0.35, take_profit_pct 0.0-1.5, drawdown_reduce_threshold 0.0-0.5, reduced_exposure 0.0-1.0. Use 0 values for disabled rules.",
         "- Each proposed strategy should include research_thesis explaining why those factors and parameters are worth testing.",
         "- Include diagnosis, avoid, and focus fields in your response: diagnosis explains what historical backtest results imply; avoid lists weak factors or parameter regions; focus lists the next research direction.",
         "- Include review_policy to decide when you should inspect the next round. Use mode=after_n_trials with a professional checkpoint size when partial evidence is enough, or mode=full_round when the whole planned set is needed.",
         "- Avoid factors marked unavailable_or_weak unless the results strongly justify them.",
         "- Prefer a small number of high-quality new strategies, usually 1 to 5.",
         "- Do not brute-force the full grid by default. Use historical backtest results to narrow or change the next tests.",
+        "- When factor-weight-only search is exhausted, change the rule structure through risk_overlay before stopping: cash reserve, stop loss, take profit, and portfolio drawdown exposure reduction.",
         "- Consider max drawdown, annual return, Calmar, monthly win rate, max monthly loss, trade count, parameter behavior, factor behavior, and repeated lack of improvement.",
         "",
         "Context JSON:",
@@ -532,6 +569,7 @@ def build_agent_prompt(run_dir: Path, strategy_file: Path, summary: dict[str, An
             "strategy_file": str(strategy_file),
             "available_factors": factors,
             "unavailable_or_weak_factors": sorted(WEAK_OR_UNAVAILABLE_FACTORS),
+            "risk_overlay_fields": RISK_OVERLAY_LIMITS,
             "latest_summary": summary,
             "recent_iteration_history": recent_history,
             "current_strategy_count": len(current_strategies),

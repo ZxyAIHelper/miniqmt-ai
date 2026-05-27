@@ -127,12 +127,51 @@
             },
             "required": ["top", "lookback", "rebalance_days"]
           },
+          "risk_overlay": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Strategy-specific risk and exposure rules. Use 0 values to disable rules.",
+            "properties": {
+              "cash_reserve": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 0.8
+              },
+              "stop_loss_pct": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 0.35
+              },
+              "take_profit_pct": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1.5
+              },
+              "drawdown_reduce_threshold": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 0.5
+              },
+              "reduced_exposure": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            },
+            "required": [
+              "cash_reserve",
+              "stop_loss_pct",
+              "take_profit_pct",
+              "drawdown_reduce_threshold",
+              "reduced_exposure"
+            ]
+          },
           "research_thesis": {
             "type": "string",
             "description": "Why this factor mix and parameter grid are worth testing."
           }
         },
-        "required": ["name", "description", "weights", "parameter_grid", "research_thesis"]
+        "required": ["name", "description", "weights", "parameter_grid", "risk_overlay", "research_thesis"]
       }
     }
   },

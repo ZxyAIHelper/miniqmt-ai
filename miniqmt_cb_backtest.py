@@ -43,6 +43,13 @@ ACTIVE_STRATEGIES: list[dict[str, Any]] = []
 DEFAULT_TOP_VALUES = [3, 5, 8]
 DEFAULT_LOOKBACK_VALUES = [40, 60, 90]
 DEFAULT_REBALANCE_VALUES = [10, 20, 40]
+RISK_OVERLAY_KEYS = {
+    "cash_reserve": (0.0, 0.8),
+    "stop_loss_pct": (0.0, 0.35),
+    "take_profit_pct": (0.0, 1.5),
+    "drawdown_reduce_threshold": (0.0, 0.5),
+    "reduced_exposure": (0.0, 1.0),
+}
 
 
 FACTOR_DESCRIPTIONS = {
@@ -275,6 +282,7 @@ def strategy_definition_rows(strategies: list[dict[str, Any]]) -> list[dict[str,
         rows.append({
             "strategy": item["name"],
             "definition": " + ".join(f"{weight:.4f}*{factor}" for factor, weight in item["weights"].items()),
+            "risk_overlay": json.dumps(normalize_risk_overlay(item.get("risk_overlay")), ensure_ascii=False, sort_keys=True),
             "description": item.get("description", ""),
         })
     return rows
@@ -319,6 +327,9 @@ def validate_strategies(strategies: Any, source: str) -> list[dict[str, Any]]:
             cleaned_item["parameter_grid"] = parameter_grid
         if safe_text(item.get("research_thesis")).strip():
             cleaned_item["research_thesis"] = safe_text(item.get("research_thesis")).strip()
+        risk_overlay = normalize_risk_overlay(item.get("risk_overlay"))
+        if risk_overlay:
+            cleaned_item["risk_overlay"] = risk_overlay
         cleaned.append(cleaned_item)
     return cleaned
 
@@ -347,6 +358,32 @@ def normalize_parameter_grid(grid: Any) -> dict[str, list[int]]:
         "lookback": normalize_parameter_values(grid.get("lookback"), DEFAULT_LOOKBACK_VALUES, DEFAULT_LOOKBACK_VALUES),
         "rebalance_days": normalize_parameter_values(grid.get("rebalance_days"), DEFAULT_REBALANCE_VALUES, DEFAULT_REBALANCE_VALUES),
     }
+
+
+def clamp_float(value: Any, default: float, min_value: float, max_value: float) -> float:
+    number = safe_float(value, default)
+    return round(min(max(number, min_value), max_value), 6)
+
+
+def normalize_risk_overlay(overlay: Any) -> dict[str, float]:
+    if not isinstance(overlay, dict):
+        return {}
+    defaults = {
+        "cash_reserve": 0.0,
+        "stop_loss_pct": 0.0,
+        "take_profit_pct": 0.0,
+        "drawdown_reduce_threshold": 0.0,
+        "reduced_exposure": 1.0,
+    }
+    cleaned = {}
+    for key, (min_value, max_value) in RISK_OVERLAY_KEYS.items():
+        if key in overlay:
+            cleaned[key] = clamp_float(overlay.get(key), defaults[key], min_value, max_value)
+    if cleaned.get("drawdown_reduce_threshold", 0.0) <= 0:
+        cleaned.pop("reduced_exposure", None)
+    elif "reduced_exposure" not in cleaned:
+        cleaned["reduced_exposure"] = 0.5
+    return cleaned
 
 
 def ensure_strategy_file(path: str) -> None:
@@ -813,6 +850,13 @@ def strategy_weights(strategy: str) -> dict[str, float]:
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
+def strategy_risk_overlay(strategy: str) -> dict[str, float]:
+    for item in ACTIVE_STRATEGIES:
+        if item["name"] == strategy:
+            return normalize_risk_overlay(item.get("risk_overlay"))
+    return {}
+
+
 def raw_factor_features(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: int, stock_data: dict[str, pd.DataFrame] | None = None) -> list[dict[str, Any]]:
     features = []
     for code, df in data.items():
@@ -1234,7 +1278,7 @@ def advanced_metrics(equity: list[dict[str, Any]], initial_cash: float) -> dict[
 
 
 def write_strategy_definitions(strategies: list[dict[str, Any]]) -> None:
-    write_csv(STRATEGY_FILE, strategy_definition_rows(strategies), ["strategy", "definition", "description"])
+    write_csv(STRATEGY_FILE, strategy_definition_rows(strategies), ["strategy", "definition", "risk_overlay", "description"])
 
 
 def write_factor_definitions(path: str) -> None:
@@ -1283,9 +1327,18 @@ def run_backtest(
     trades: list[dict[str, Any]] = []
     equity: list[dict[str, Any]] = []
     rebalance_index = 0
+    risk_overlay = strategy_risk_overlay(args.strategy)
+    cash_reserve = safe_float(risk_overlay.get("cash_reserve"), 0.0)
+    stop_loss_pct = safe_float(risk_overlay.get("stop_loss_pct"), 0.0)
+    take_profit_pct = safe_float(risk_overlay.get("take_profit_pct"), 0.0)
+    drawdown_reduce_threshold = safe_float(risk_overlay.get("drawdown_reduce_threshold"), 0.0)
+    reduced_exposure = safe_float(risk_overlay.get("reduced_exposure"), 1.0)
+    portfolio_peak = args.cash
 
     for idx, date in enumerate(dates):
         total_value = portfolio_value(cash, positions, data, date)
+        portfolio_peak = max(portfolio_peak, total_value)
+        portfolio_drawdown = total_value / portfolio_peak - 1.0 if portfolio_peak > 0 else 0.0
         equity.append({
             "date": date.strftime("%Y%m%d"),
             "cash": round(cash, 4),
@@ -1293,6 +1346,37 @@ def run_backtest(
             "total_value": round(total_value, 4),
             "holding_count": len(positions),
         })
+
+        for code in list(positions):
+            pos = positions.get(code)
+            if pos is None or pos.cost <= 0:
+                continue
+            price = close_on(data, code, date)
+            if price <= 0:
+                continue
+            position_return = price / pos.cost - 1.0
+            reason = ""
+            if stop_loss_pct > 0 and position_return <= -stop_loss_pct:
+                reason = "stop_loss"
+            elif take_profit_pct > 0 and position_return >= take_profit_pct:
+                reason = "take_profit"
+            if not reason:
+                continue
+            sell_price = price * (1.0 - args.slippage_rate)
+            amount = pos.volume * sell_price
+            fee = amount * args.fee_rate
+            cash += amount - fee
+            positions.pop(code, None)
+            trades.append({
+                "date": date.strftime("%Y%m%d"),
+                "side": "sell",
+                "code": code,
+                "price": round(sell_price, 4),
+                "volume": pos.volume,
+                "amount": round(amount, 4),
+                "fee": round(fee, 4),
+                "reason": reason,
+            })
 
         if idx < args.lookback:
             continue
@@ -1327,7 +1411,41 @@ def run_backtest(
             })
 
         total_value = portfolio_value(cash, positions, data, date)
-        target_value = total_value / len(selected) if selected else 0.0
+        exposure = max(0.0, min(1.0, 1.0 - cash_reserve))
+        if drawdown_reduce_threshold > 0 and portfolio_drawdown <= -drawdown_reduce_threshold:
+            exposure = min(exposure, max(0.0, min(1.0, reduced_exposure)))
+        target_value = total_value * exposure / len(selected) if selected else 0.0
+
+        for code in selected:
+            if code not in positions:
+                continue
+            price = close_on(data, code, date)
+            if price <= 0:
+                continue
+            sell_price = price * (1.0 - args.slippage_rate)
+            current_volume = positions[code].volume
+            current_value = current_volume * sell_price
+            sell_value = current_value - target_value
+            volume = min(current_volume, round_lot(sell_value / sell_price))
+            if volume <= 0:
+                continue
+            amount = volume * sell_price
+            fee = amount * args.fee_rate
+            positions[code] = Position(current_volume - volume, positions[code].cost)
+            if positions[code].volume <= 0:
+                positions.pop(code, None)
+            cash += amount - fee
+            trades.append({
+                "date": date.strftime("%Y%m%d"),
+                "side": "sell",
+                "code": code,
+                "price": round(sell_price, 4),
+                "volume": volume,
+                "amount": round(amount, 4),
+                "fee": round(fee, 4),
+                "reason": "rebalance_reduce",
+            })
+
         for code in selected:
             price = close_on(data, code, date)
             if price <= 0:
@@ -1348,7 +1466,10 @@ def run_backtest(
             if volume <= 0:
                 continue
             cash -= amount + fee
-            positions[code] = Position(current_volume + volume, buy_price)
+            new_volume = current_volume + volume
+            old_cost = positions.get(code, Position(0, 0.0)).cost
+            avg_cost = (current_volume * old_cost + volume * buy_price) / new_volume if new_volume > 0 else buy_price
+            positions[code] = Position(new_volume, avg_cost)
             trades.append({
                 "date": date.strftime("%Y%m%d"),
                 "side": "buy",

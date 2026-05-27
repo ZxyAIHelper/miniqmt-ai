@@ -662,6 +662,11 @@ HTML = r"""<!doctype html>
       if (!entries.length) return "";
       return `<div class="ai-mini">${entries.map(([factor, weight]) => `<span>${esc(factor)} ${Number(weight).toFixed(3)}</span>`).join("")}</div>`;
     }
+    function renderRiskOverlay(overlay) {
+      const entries = Object.entries(overlay || {}).filter(([, value]) => Number(value) !== 0);
+      if (!entries.length) return "";
+      return `<div class="ai-mini">${entries.map(([key, value]) => `<span>${esc(key)}: ${Number(value).toFixed(3)}</span>`).join("")}</div>`;
+    }
     function renderAIDecision() {
       const decision = state.decision || {};
       const hasDecision = Boolean(decision.time || decision.reason || decision.agent_response);
@@ -692,6 +697,7 @@ HTML = r"""<!doctype html>
               <strong>${esc(item.name || "-")}</strong>
               <div class="subtle">${esc(item.description || "")}</div>
               ${renderAgentWeights(item.weights)}
+              ${renderRiskOverlay(item.risk_overlay)}
             </div>
           `).join("") : `<div class="subtle">本轮 AI 没有提出新的有效策略。</div>`}
         </div>
@@ -749,6 +755,7 @@ HTML = r"""<!doctype html>
               <strong>${esc(item.name || "-")}</strong>
               <div class="subtle">${esc(item.research_thesis || item.description || "")}</div>
               ${renderStrategyGrid(item)}
+              ${renderRiskOverlay(item.risk_overlay)}
             </div>
           `).join("") : `<div class="subtle">本轮没有新策略参数建议。</div>`}
         </div>
