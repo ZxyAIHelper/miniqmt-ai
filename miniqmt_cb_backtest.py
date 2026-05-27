@@ -38,6 +38,7 @@ STRATEGY_CANDIDATES_FILE = os.path.join(BASE_DIR, "strategy_candidates.json")
 WORKER_DATA: dict[str, pd.DataFrame] | None = None
 WORKER_ARGS: argparse.Namespace | None = None
 WORKER_STOCK_DATA: dict[str, pd.DataFrame] | None = None
+WORKER_FACTOR_CACHE: dict[tuple[int, str], dict[str, dict[str, float]]] | None = None
 ACTIVE_STRATEGIES: list[dict[str, Any]] = []
 DEFAULT_TOP_VALUES = [3, 5, 8]
 DEFAULT_LOOKBACK_VALUES = [40, 60, 90]
@@ -74,6 +75,7 @@ FACTOR_DESCRIPTIONS = {
     "stock_momentum": "Underlying stock momentum when stock code is available.",
     "stock_volatility": "Negative underlying stock volatility when stock code is available.",
 }
+FACTOR_COLUMNS = list(FACTOR_DESCRIPTIONS.keys())
 
 
 GENERATED_STRATEGIES = [
@@ -462,6 +464,20 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
+    factor_columns_sql = ",\n            ".join(f"{factor} REAL" for factor in FACTOR_COLUMNS)
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS cb_factor_daily (
+            code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            lookback INTEGER NOT NULL,
+            {factor_columns_sql},
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (code, date, lookback)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cb_factor_daily_date ON cb_factor_daily (date, lookback)")
     conn.commit()
     return conn
 
@@ -774,7 +790,7 @@ def strategy_weights(strategy: str) -> dict[str, float]:
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: int, strategy: str, stock_data: dict[str, pd.DataFrame] | None = None) -> list[tuple[str, float]]:
+def raw_factor_features(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: int, stock_data: dict[str, pd.DataFrame] | None = None) -> list[dict[str, Any]]:
     features = []
     for code, df in data.items():
         hist = df.loc[df.index <= date].tail(lookback + 1)
@@ -865,9 +881,12 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
             "stock_momentum": stock_momentum,
             "stock_volatility": stock_volatility,
         })
+    return features
 
+
+def normalized_factor_rows(features: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
     if not features:
-        return []
+        return {}
 
     momentum_values = [item["momentum"] for item in features]
     liquidity_values = [math.log1p(item["liquidity"]) for item in features]
@@ -898,7 +917,7 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
     stock_momentum_values = [item["stock_momentum"] for item in features]
     stock_volatility_values = [item["stock_volatility"] for item in features]
 
-    scored = []
+    factor_rows = {}
     for item in features:
         momentum_z = zscore(item["momentum"], momentum_values)
         short_reversal_z = -zscore(item["short_momentum"], short_momentum_values)
@@ -959,11 +978,142 @@ def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: 
             "stock_momentum": stock_momentum_z,
             "stock_volatility": stock_volatility_z,
         }
-        score = sum(weight * factor_values[factor] for factor, weight in strategy_weights(strategy).items())
+        factor_rows[item["code"]] = factor_values
+    return factor_rows
 
-        scored.append((item["code"], score))
+
+def score_from_factor_rows(factor_rows: dict[str, dict[str, float]], strategy: str) -> list[tuple[str, float]]:
+    weights = strategy_weights(strategy)
+    scored = []
+    for code, factor_values in factor_rows.items():
+        score = sum(weight * factor_values.get(factor, 0.0) for factor, weight in weights.items())
+        scored.append((code, score))
     scored.sort(key=lambda item: item[1], reverse=True)
     return scored
+
+
+def score_universe(data: dict[str, pd.DataFrame], date: pd.Timestamp, lookback: int, strategy: str, stock_data: dict[str, pd.DataFrame] | None = None) -> list[tuple[str, float]]:
+    return score_from_factor_rows(normalized_factor_rows(raw_factor_features(data, date, lookback, stock_data)), strategy)
+
+
+def rebalance_dates_for_trial(dates: list[pd.Timestamp], lookback: int, rebalance_days: int) -> list[pd.Timestamp]:
+    result = []
+    rebalance_index = 0
+    for idx, date in enumerate(dates):
+        if idx < lookback:
+            continue
+        if rebalance_index % rebalance_days != 0:
+            rebalance_index += 1
+            continue
+        rebalance_index += 1
+        result.append(date)
+    return result
+
+
+def needed_factor_dates(data: dict[str, pd.DataFrame], trials: list[tuple[str, int, int, int]]) -> dict[int, set[str]]:
+    dates = trading_dates(data)
+    needed: dict[int, set[str]] = {}
+    for _strategy, _top, lookback, rebalance_days in trials:
+        bucket = needed.setdefault(lookback, set())
+        for date in rebalance_dates_for_trial(dates, lookback, rebalance_days):
+            bucket.add(date.strftime("%Y%m%d"))
+    return needed
+
+
+def factor_row_count(conn: sqlite3.Connection, date: str, lookback: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM cb_factor_daily WHERE date = ? AND lookback = ?",
+        (date, lookback),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def upsert_factor_rows(conn: sqlite3.Connection, date: str, lookback: int, rows: dict[str, dict[str, float]]) -> None:
+    if not rows:
+        return
+    columns = ["code", "date", "lookback", *FACTOR_COLUMNS, "updated_at"]
+    placeholders = ",".join("?" for _ in columns)
+    update_clause = ", ".join(f"{factor}=excluded.{factor}" for factor in FACTOR_COLUMNS)
+    sql = f"""
+        INSERT INTO cb_factor_daily ({",".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(code, date, lookback) DO UPDATE SET
+            {update_clause},
+            updated_at=excluded.updated_at
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    values = [
+        [code, date, lookback, *[safe_float(factors.get(factor), 0.0) for factor in FACTOR_COLUMNS], now]
+        for code, factors in rows.items()
+    ]
+    conn.executemany(sql, values)
+
+
+def ensure_factor_cache_sqlite(
+    conn: sqlite3.Connection,
+    data: dict[str, pd.DataFrame],
+    stock_data: dict[str, pd.DataFrame] | None,
+    trials: list[tuple[str, int, int, int]],
+) -> None:
+    needed = needed_factor_dates(data, trials)
+    expected_min_count = max(1, int(len(data) * 0.8))
+    total_dates = sum(len(items) for items in needed.values())
+    done = 0
+    computed = 0
+    skipped = 0
+    started = time.perf_counter()
+    for lookback, date_values in sorted(needed.items()):
+        for date_text in sorted(date_values):
+            done += 1
+            if factor_row_count(conn, date_text, lookback) >= expected_min_count:
+                skipped += 1
+            else:
+                date = pd.Timestamp(datetime.strptime(date_text, "%Y%m%d"))
+                rows = normalized_factor_rows(raw_factor_features(data, date, lookback, stock_data))
+                upsert_factor_rows(conn, date_text, lookback, rows)
+                computed += 1
+                if computed % 20 == 0:
+                    conn.commit()
+            if done % 25 == 0 or done == total_dates:
+                print(f"factor_cache_progress={done}/{total_dates} computed={computed} skipped={skipped}", flush=True)
+    conn.commit()
+    print(f"factor_cache_done computed={computed} skipped={skipped} elapsed_seconds={time.perf_counter() - started:.2f}", flush=True)
+
+
+def load_factor_cache(conn: sqlite3.Connection, data: dict[str, pd.DataFrame], trials: list[tuple[str, int, int, int]]) -> dict[tuple[int, str], dict[str, dict[str, float]]]:
+    dates_by_lookback = needed_factor_dates(data, trials)
+    cache: dict[tuple[int, str], dict[str, dict[str, float]]] = {}
+    columns = ", ".join(["code", "date", "lookback", *FACTOR_COLUMNS])
+    for lookback, date_values in sorted(dates_by_lookback.items()):
+        if not date_values:
+            continue
+        placeholders = ",".join("?" for _ in date_values)
+        rows = conn.execute(
+            f"SELECT {columns} FROM cb_factor_daily WHERE lookback = ? AND date IN ({placeholders})",
+            [lookback, *sorted(date_values)],
+        ).fetchall()
+        for row in rows:
+            code = row[0]
+            date_text = row[1]
+            row_lookback = int(row[2])
+            factors = {factor: safe_float(row[idx + 3], 0.0) for idx, factor in enumerate(FACTOR_COLUMNS)}
+            cache.setdefault((row_lookback, date_text), {})[code] = factors
+    return cache
+
+
+def score_universe_cached(
+    factor_cache: dict[tuple[int, str], dict[str, dict[str, float]]] | None,
+    data: dict[str, pd.DataFrame],
+    date: pd.Timestamp,
+    lookback: int,
+    strategy: str,
+    stock_data: dict[str, pd.DataFrame] | None = None,
+) -> list[tuple[str, float]]:
+    if factor_cache is not None:
+        rows = factor_cache.get((lookback, date.strftime("%Y%m%d")))
+        if rows:
+            return score_from_factor_rows(rows, strategy)
+    return score_universe(data, date, lookback, strategy, stock_data)
 
 
 def portfolio_value(cash: float, positions: dict[str, Position], data: dict[str, pd.DataFrame], date: pd.Timestamp) -> float:
@@ -1088,7 +1238,12 @@ def best_by_strategy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [best[name] for name in sorted(best)]
 
 
-def run_backtest(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+def run_backtest(
+    args: argparse.Namespace,
+    data: dict[str, pd.DataFrame],
+    stock_data: dict[str, pd.DataFrame] | None = None,
+    factor_cache: dict[tuple[int, str], dict[str, dict[str, float]]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     dates = trading_dates(data)
     if len(dates) <= args.lookback:
         raise RuntimeError("Not enough historical bars for the requested lookback.")
@@ -1116,7 +1271,7 @@ def run_backtest(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_
             continue
         rebalance_index += 1
 
-        selected = [code for code, _ in score_universe(data, date, args.lookback, args.strategy, stock_data)[: args.top]]
+        selected = [code for code, _ in score_universe_cached(factor_cache, data, date, args.lookback, args.strategy, stock_data)[: args.top]]
         selected_set = set(selected)
 
         for code in list(positions):
@@ -1264,10 +1419,17 @@ def strategy_trials(args: argparse.Namespace | None = None) -> list[tuple[str, i
     return trials
 
 
-def result_for_trial(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None, run_id: str, trial: tuple[str, int, int, int]) -> tuple[dict[str, Any], argparse.Namespace]:
+def result_for_trial(
+    args: argparse.Namespace,
+    data: dict[str, pd.DataFrame],
+    stock_data: dict[str, pd.DataFrame] | None,
+    factor_cache: dict[tuple[int, str], dict[str, dict[str, float]]] | None,
+    run_id: str,
+    trial: tuple[str, int, int, int],
+) -> tuple[dict[str, Any], argparse.Namespace]:
     strategy, top, lookback, rebalance_day = trial
     trial_args = clone_args(args, strategy, top, lookback, rebalance_day)
-    _trades, _equity, summary = run_backtest(trial_args, data, stock_data)
+    _trades, _equity, summary = run_backtest(trial_args, data, stock_data, factor_cache)
     passed = (
         abs(safe_float(summary["max_drawdown"], 0.0)) <= args.max_drawdown
         and safe_float(summary["annual_return"], 0.0) >= 0.08
@@ -1288,11 +1450,17 @@ def result_for_trial(args: argparse.Namespace, data: dict[str, pd.DataFrame], st
     return row, trial_args
 
 
-def init_worker(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame]) -> None:
-    global WORKER_ARGS, WORKER_DATA, WORKER_STOCK_DATA
+def init_worker(
+    args: argparse.Namespace,
+    data: dict[str, pd.DataFrame],
+    stock_data: dict[str, pd.DataFrame],
+    factor_cache: dict[tuple[int, str], dict[str, dict[str, float]]],
+) -> None:
+    global WORKER_ARGS, WORKER_DATA, WORKER_STOCK_DATA, WORKER_FACTOR_CACHE
     WORKER_ARGS = args
     WORKER_DATA = data
     WORKER_STOCK_DATA = stock_data
+    WORKER_FACTOR_CACHE = factor_cache
     set_active_strategies(args.strategy_candidates)
 
 
@@ -1300,10 +1468,15 @@ def worker_trial(payload: tuple[str, tuple[str, int, int, int]]) -> tuple[dict[s
     run_id, trial = payload
     if WORKER_ARGS is None or WORKER_DATA is None:
         raise RuntimeError("Worker was not initialized.")
-    return result_for_trial(WORKER_ARGS, WORKER_DATA, WORKER_STOCK_DATA, run_id, trial)
+    return result_for_trial(WORKER_ARGS, WORKER_DATA, WORKER_STOCK_DATA, WORKER_FACTOR_CACHE, run_id, trial)
 
 
-def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data: dict[str, pd.DataFrame] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+def optimize(
+    args: argparse.Namespace,
+    data: dict[str, pd.DataFrame],
+    stock_data: dict[str, pd.DataFrame] | None = None,
+    factor_cache: dict[tuple[int, str], dict[str, dict[str, float]]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     trials = strategy_trials(args)
     rows = []
     best: dict[str, Any] | None = None
@@ -1326,7 +1499,7 @@ def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data
     workers = max(1, int(args.workers or 1))
     print(f"optimize_workers={workers} trials={total}", flush=True)
     if workers == 1:
-        iterator = (result_for_trial(args, data, stock_data, run_id, trial) for trial in trials)
+        iterator = (result_for_trial(args, data, stock_data, factor_cache, run_id, trial) for trial in trials)
         for row, trial_args in iterator:
             done += 1
             rows.append(row)
@@ -1339,7 +1512,7 @@ def optimize(args: argparse.Namespace, data: dict[str, pd.DataFrame], stock_data
                 best = {**row, "_args": trial_args}
     else:
         payloads = [(run_id, trial) for trial in trials]
-        with ProcessPoolExecutor(max_workers=workers, initializer=init_worker, initargs=(args, data, stock_data or {})) as executor:
+        with ProcessPoolExecutor(max_workers=workers, initializer=init_worker, initargs=(args, data, stock_data or {}, factor_cache or {})) as executor:
             futures = [executor.submit(worker_trial, payload) for payload in payloads]
             for future in as_completed(futures):
                 row, trial_args = future.result()
@@ -1407,9 +1580,16 @@ def main() -> int:
     print(f"loaded_underlying_stocks={len(stock_data)}", flush=True)
     print(f"load_elapsed_seconds={time.perf_counter() - load_started_at:.2f}", flush=True)
 
+    factor_cache = None
     if args.optimize:
+        factor_started_at = time.perf_counter()
+        trials = strategy_trials(args)
+        ensure_factor_cache_sqlite(conn, data, stock_data, trials)
+        factor_cache = load_factor_cache(conn, data, trials)
+        print(f"loaded_factor_cache_keys={len(factor_cache)}", flush=True)
+        print(f"factor_cache_elapsed_seconds={time.perf_counter() - factor_started_at:.2f}", flush=True)
         started_at = time.perf_counter()
-        rows, best = optimize(args, data, stock_data)
+        rows, best = optimize(args, data, stock_data, factor_cache)
         fields = optimize_fields()
         write_csv(OPTIMIZE_FILE, rows, fields)
         write_csv(BEST_BY_STRATEGY_FILE, best_by_strategy(rows), fields)
@@ -1428,7 +1608,11 @@ def main() -> int:
             print(f"  {key}: {best[key]}", flush=True)
         args = best["_args"]
 
-    trades, equity, summary = run_backtest(args, data, stock_data)
+    if factor_cache is None:
+        single_trials = [(args.strategy, args.top, args.lookback, args.rebalance_days)]
+        ensure_factor_cache_sqlite(conn, data, stock_data, single_trials)
+        factor_cache = load_factor_cache(conn, data, single_trials)
+    trades, equity, summary = run_backtest(args, data, stock_data, factor_cache)
     monthly = period_returns(equity, 6)
     yearly = period_returns(equity, 4)
     write_csv(TRADES_FILE, trades, ["date", "side", "code", "price", "volume", "amount", "fee", "reason"])

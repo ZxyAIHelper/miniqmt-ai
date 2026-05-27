@@ -88,6 +88,11 @@ factor set includes price, volatility, liquidity, drawdown, price-channel,
 downside-risk, maturity, size, forced-redemption, and optional conversion or
 underlying-stock factors when MiniQMT provides the needed fields.
 
+Cross-sectional factor values are cached in the SQLite wide table
+`cb_factor_daily`. The table stores one row per `(code, date, lookback)` with
+all normalized factor columns. Optimization should reuse this table instead of
+recomputing Pandas rolling windows for every strategy trial.
+
 ## Required Local Config
 
 `config.py` stores local MiniQMT settings, especially `QMT_USER_DATA_PATH`.
