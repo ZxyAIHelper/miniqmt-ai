@@ -209,6 +209,47 @@ class DrawdownTargetTests(unittest.TestCase):
         self.assertIn("--stop-after-trials", command)
         self.assertIn("120", command)
 
+    def test_sync_factors_skips_single_strategy_validation(self):
+        args = miniqmt_cb_backtest.parse_args_from([
+            "miniqmt_cb_backtest.py",
+            "--sync-factors",
+        ])
+
+        miniqmt_cb_backtest.validate_requested_strategy(args, set())
+
+    def test_full_factor_trials_use_all_requested_lookbacks(self):
+        args = miniqmt_cb_backtest.parse_args_from([
+            "miniqmt_cb_backtest.py",
+            "--sync-factors",
+            "--factor-lookbacks",
+            "40,90",
+        ])
+
+        self.assertEqual(miniqmt_cb_backtest.full_factor_trials(args), [
+            ("__factor_sync__", 1, 40, 1),
+            ("__factor_sync__", 1, 90, 1),
+        ])
+
+    def test_factor_row_count_requires_all_current_factor_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "factors.sqlite3"
+            with patch.object(miniqmt_cb_backtest, "DB_FILE", str(db_path)):
+                conn = miniqmt_cb_backtest.init_db()
+            columns = ["code", "date", "lookback", *miniqmt_cb_backtest.FACTOR_COLUMNS, "updated_at"]
+            values = ["110000.SH", "20260101", 40, *[1.0 for _ in miniqmt_cb_backtest.FACTOR_COLUMNS], "now"]
+            conn.execute(
+                f"INSERT INTO cb_factor_daily ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                values,
+            )
+            conn.commit()
+            self.assertEqual(miniqmt_cb_backtest.factor_row_count(conn, "20260101", 40), 1)
+            conn.execute(
+                f"UPDATE cb_factor_daily SET {miniqmt_cb_backtest.FACTOR_COLUMNS[0]} = NULL WHERE code = '110000.SH'"
+            )
+            conn.commit()
+            self.assertEqual(miniqmt_cb_backtest.factor_row_count(conn, "20260101", 40), 0)
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

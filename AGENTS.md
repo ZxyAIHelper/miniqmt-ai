@@ -92,6 +92,11 @@ Cross-sectional factor values are cached in the SQLite wide table
 `cb_factor_daily`. The table stores one row per `(code, date, lookback)` with
 all normalized factor columns. Optimization should reuse this table instead of
 recomputing Pandas rolling windows for every strategy trial.
+Use `python miniqmt_cb_backtest.py --sync-factors --factor-lookbacks 40,60,90`
+to precompute or incrementally update the factor cache. If a new factor is added
+to `FACTOR_DESCRIPTIONS`, `init_db()` automatically adds the missing wide-table
+column and existing rows with null values for the new factor are recomputed on
+the next sync or backtest run.
 
 ## Required Local Config
 

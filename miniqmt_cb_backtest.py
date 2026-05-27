@@ -200,6 +200,9 @@ def parse_args_from(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--optimize", action="store_true", help="Search strategy/parameter combinations and keep the best under max drawdown.")
     parser.add_argument("--workers", type=int, default=default_workers(), help="Parallel worker processes for optimize mode.")
     parser.add_argument("--stop-after-trials", type=int, default=0, help="Optimize mode checkpoint size. 0 means run all generated trials.")
+    parser.add_argument("--sync-factors", action="store_true", help="Precompute missing factor rows for all bonds, dates, and selected lookbacks, then exit.")
+    parser.add_argument("--factor-lookbacks", default="40,60,90", help="Comma-separated lookbacks for --sync-factors.")
+    parser.add_argument("--rebuild-factors", action="store_true", help="Force recomputing requested factor rows even when cached rows exist.")
     values = argv[1:] if argv is not None else None
     return parser.parse_args(values)
 
@@ -209,7 +212,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_requested_strategy(args: argparse.Namespace, strategy_names: set[str]) -> None:
-    if args.optimize:
+    if args.optimize or args.sync_factors:
         return
     if args.strategy not in strategy_names:
         raise ValueError(f"Strategy {args.strategy!r} is not in {args.strategy_file}. Available: {', '.join(sorted(strategy_names))}")
@@ -222,6 +225,18 @@ def three_years_ago() -> str:
 def default_workers() -> int:
     cpu_count = os.cpu_count() or 2
     return max(1, min(8, cpu_count - 1))
+
+
+def parse_int_csv(text: str, allowed: list[int]) -> list[int]:
+    values = []
+    for part in safe_text(text).split(","):
+        try:
+            value = int(float(part.strip()))
+        except Exception:
+            continue
+        if value in allowed and value not in values:
+            values.append(value)
+    return values or list(allowed)
 
 
 def bootstrap_xtquant() -> None:
@@ -477,6 +492,14 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
+    existing_factor_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(cb_factor_daily)").fetchall()
+    }
+    for factor in FACTOR_COLUMNS:
+        if factor not in existing_factor_columns:
+            conn.execute(f"ALTER TABLE cb_factor_daily ADD COLUMN {factor} REAL")
+            print(f"factor_schema_added_column={factor}", flush=True)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cb_factor_daily_date ON cb_factor_daily (date, lookback)")
     conn.commit()
     return conn
@@ -1020,9 +1043,15 @@ def needed_factor_dates(data: dict[str, pd.DataFrame], trials: list[tuple[str, i
     return needed
 
 
+def full_factor_trials(args: argparse.Namespace) -> list[tuple[str, int, int, int]]:
+    lookbacks = parse_int_csv(args.factor_lookbacks, DEFAULT_LOOKBACK_VALUES)
+    return [("__factor_sync__", 1, lookback, 1) for lookback in lookbacks]
+
+
 def factor_row_count(conn: sqlite3.Connection, date: str, lookback: int) -> int:
+    completeness_clause = " AND ".join(f"{factor} IS NOT NULL" for factor in FACTOR_COLUMNS)
     row = conn.execute(
-        "SELECT COUNT(*) FROM cb_factor_daily WHERE date = ? AND lookback = ?",
+        f"SELECT COUNT(*) FROM cb_factor_daily WHERE date = ? AND lookback = ? AND {completeness_clause}",
         (date, lookback),
     ).fetchone()
     return int(row[0] or 0)
@@ -1054,6 +1083,7 @@ def ensure_factor_cache_sqlite(
     data: dict[str, pd.DataFrame],
     stock_data: dict[str, pd.DataFrame] | None,
     trials: list[tuple[str, int, int, int]],
+    force: bool = False,
 ) -> None:
     needed = needed_factor_dates(data, trials)
     expected_min_count = max(1, int(len(data) * 0.8))
@@ -1065,7 +1095,7 @@ def ensure_factor_cache_sqlite(
     for lookback, date_values in sorted(needed.items()):
         for date_text in sorted(date_values):
             done += 1
-            if factor_row_count(conn, date_text, lookback) >= expected_min_count:
+            if not force and factor_row_count(conn, date_text, lookback) >= expected_min_count:
                 skipped += 1
             else:
                 date = pd.Timestamp(datetime.strptime(date_text, "%Y%m%d"))
@@ -1581,10 +1611,18 @@ def main() -> int:
     print(f"load_elapsed_seconds={time.perf_counter() - load_started_at:.2f}", flush=True)
 
     factor_cache = None
+    if args.sync_factors:
+        factor_started_at = time.perf_counter()
+        trials = full_factor_trials(args)
+        ensure_factor_cache_sqlite(conn, data, stock_data, trials, force=args.rebuild_factors)
+        print(f"sync_factors_elapsed_seconds={time.perf_counter() - factor_started_at:.2f}", flush=True)
+        print("sync_factors_done", flush=True)
+        return 0
+
     if args.optimize:
         factor_started_at = time.perf_counter()
         trials = strategy_trials(args)
-        ensure_factor_cache_sqlite(conn, data, stock_data, trials)
+        ensure_factor_cache_sqlite(conn, data, stock_data, trials, force=args.rebuild_factors)
         factor_cache = load_factor_cache(conn, data, trials)
         print(f"loaded_factor_cache_keys={len(factor_cache)}", flush=True)
         print(f"factor_cache_elapsed_seconds={time.perf_counter() - factor_started_at:.2f}", flush=True)
@@ -1610,7 +1648,7 @@ def main() -> int:
 
     if factor_cache is None:
         single_trials = [(args.strategy, args.top, args.lookback, args.rebalance_days)]
-        ensure_factor_cache_sqlite(conn, data, stock_data, single_trials)
+        ensure_factor_cache_sqlite(conn, data, stock_data, single_trials, force=args.rebuild_factors)
         factor_cache = load_factor_cache(conn, data, single_trials)
     trades, equity, summary = run_backtest(args, data, stock_data, factor_cache)
     monthly = period_returns(equity, 6)
